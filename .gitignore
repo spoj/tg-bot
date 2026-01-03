@@ -1,0 +1,19 @@
+# Sensitive files
+*.secret
+*.credentials
+.env
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.ruff_cache/
+
+# Runtime
+bot.log
+*.lock
+!uv.lock
