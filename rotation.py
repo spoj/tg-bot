@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from models import reasoning_complete
+from prompts import EXTRACT_COMMITMENTS, PAIRWISE_ANALYSIS, SYNTHESIZE_FINDINGS
 
 # Config
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path.home() / "life"))
@@ -53,31 +54,9 @@ async def extract_commitments(content: str, rotation_date: str) -> str:
         messages=[
             {
                 "role": "user",
-                "content": f"""Extract all open commitments from this stream file to carry forward to the new stream.
-
-IMPORTANT: The stream is append-only and chronological. Entries are added throughout the file as they happen, NOT just in a header section. You must scan the ENTIRE file.
-
-Extract:
-1. Open TODOs - lines starting with "TODO:" that are NOT marked with ✓
-2. Open Projects - longer-running work items, initiatives, or ongoing efforts that aren't discrete tasks
-   - Look for "### Projects" section headers
-   - Also look for project mentions throughout (e.g., "POC stage", "in progress", named initiatives)
-   - Skip completed/closed projects (marked ✓ or explicitly closed)
-3. Calendar items - ALL "+cal" entries that are still relevant:
-   - Recurring events (e.g., "+cal Saturdays...", "+cal Monthly...")
-   - Annual events (e.g., "+cal 05-07: birthday")
-   - Future dated events (date >= {rotation_date})
-   - Skip past one-time events (date < {rotation_date})
-
-Output format:
-- Group: TODOs first, then Projects, then Calendar
-- One item per line, preserve original format
-- For calendar: recurring first, then annual, then upcoming by date
-
-Today's date for reference: {rotation_date}
-
-Stream content:
-{content}""",
+                "content": EXTRACT_COMMITMENTS.format(
+                    rotation_date=rotation_date, content=content
+                ),
             }
         ],
     )
@@ -104,32 +83,13 @@ Recently queried topics (sample):
         messages=[
             {
                 "role": "user",
-                "content": f"""Compare these two stream files for dream time reflection.
-
-Context: This is a personal memory stream - append-only, chronological notes capturing thoughts, facts, events, and learnings. Entries include:
-- Facts and reference data (names, dates, account numbers)
-- Calendar events (+cal)
-- Tasks (TODO:) and completions (✓)
-- Corrections ([corrected]) and behavioral learnings ([model])
-- Ideas, conversations, moods
-
-Look for:
-- Factual contradictions (dates, names, numbers that don't match)
-- Stale information (things that have changed or resolved)
-- Threads that appear in both files (evolution, progress, or stagnation)
-- Patterns in behavior or topics
-- Missed connections (related things not linked)
-
-Note: There may be time gaps between files. Focus on what you can observe from these two.
-Be specific - cite line content, not just topics.
-{access_context}
---- Stream from {fresh_date} (most recent) ---
-{fresh_content}
-
---- Stream from {older_date} ---
-{older_content}
-
-Observations:""",
+                "content": PAIRWISE_ANALYSIS.format(
+                    access_context=access_context,
+                    fresh_date=fresh_date,
+                    fresh_content=fresh_content,
+                    older_date=older_date,
+                    older_content=older_content,
+                ),
             }
         ],
     )
@@ -144,22 +104,7 @@ async def synthesize(observations: list[str]) -> str:
         messages=[
             {
                 "role": "user",
-                "content": f"""Synthesize these pairwise observations into dream time findings.
-
-These observations compared the current stream against older archives. Your job is to consolidate them into actionable findings for the agent's self-improvement.
-
-Focus areas:
-- Data integrity: contradictions, outdated info, things needing [corrected] tags
-- Open threads: things mentioned but not resolved, patterns of avoidance
-- Behavioral patterns: what topics recur, what gets dropped, what's queried often
-- Connections: ideas that evolved, threads that link across time
-
-Be specific and cite content. Skip observations that are just "interesting" but not actionable.
-
-Observations from pairwise comparisons:
-{numbered}
-
-Synthesized findings:""",
+                "content": SYNTHESIZE_FINDINGS.format(numbered_observations=numbered),
             }
         ],
     )

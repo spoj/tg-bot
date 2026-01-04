@@ -15,8 +15,8 @@ from bot import (
     load_wakeups,
     save_wakeups,
     execute_tool,
-    extract_system_prompt,
-    LOG_DIR,
+    get_system_prompt,
+    DATA_DIR,
 )
 
 
@@ -270,59 +270,27 @@ class TestExecuteToolDispatch:
             mock.assert_called_once_with(["a", "b"], 1)
 
 
-class TestExtractSystemPrompt:
-    """Tests for extract_system_prompt()."""
+class TestGetSystemPrompt:
+    """Tests for get_system_prompt()."""
 
-    def test_skips_terminal_tools_section(self):
-        """Bot skips '## Tools (terminal)' section since it has its own tool implementations."""
-        test_content = """# Life Agent Instructions
+    def test_contains_core_instructions(self):
+        """System prompt contains the essential life agent instructions."""
+        result = get_system_prompt()
+        assert "Life Agent Instructions" in result
+        assert "memory" in result.lower()
+        assert "stream.txt" in result
 
-## Identity
-You are a second brain.
+    def test_contains_telegram_formatting(self):
+        """System prompt includes Telegram HTML formatting instructions."""
+        result = get_system_prompt()
+        assert "Telegram" in result
+        assert "<b>" in result  # HTML formatting instructions
 
-## Tools (terminal)
-This should be skipped.
-- tool1
-- tool2
-
-## Tools (telegram bot)
-This should be included.
-
-## Behavioral Guidelines
-This should also be included.
-"""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write(test_content)
-            temp_path = Path(f.name)
-
-        try:
-            with patch("bot.AGENTS_MD", temp_path):
-                result = extract_system_prompt()
-                assert "second brain" in result
-                assert "Behavioral Guidelines" in result
-                assert "Tools (telegram bot)" in result
-                assert "This should be skipped" not in result
-                assert "tool1" not in result
-        finally:
-            temp_path.unlink(missing_ok=True)
-
-    def test_missing_file_returns_default(self):
-        with patch("bot.AGENTS_MD", Path("/nonexistent/AGENTS.md")):
-            result = extract_system_prompt()
-            assert "helpful assistant" in result
-
-    def test_includes_telegram_formatting_instructions(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("# Test\nSome content")
-            temp_path = Path(f.name)
-
-        try:
-            with patch("bot.AGENTS_MD", temp_path):
-                result = extract_system_prompt()
-                assert "Telegram" in result
-                assert "<b>" in result  # HTML formatting instructions
-        finally:
-            temp_path.unlink(missing_ok=True)
+    def test_contains_owner_placeholder(self):
+        """System prompt has owner name substituted."""
+        result = get_system_prompt()
+        # Should not contain the literal placeholder
+        assert "{owner_name}" not in result
 
 
 class TestToolStreamReplace:
@@ -334,7 +302,7 @@ class TestToolStreamReplace:
             stream_file = tmpdir / "stream.txt"
             stream_file.write_text("# stream\n\nLine 1\nLine 2\nLine 3\n")
 
-            with patch("bot.LOG_DIR", tmpdir):
+            with patch("bot.DATA_DIR", tmpdir):
                 result = tool_stream_replace("Line 2", "Updated Line 2")
                 assert "Replaced" in result
                 content = stream_file.read_text()
@@ -347,7 +315,7 @@ class TestToolStreamReplace:
             stream_file = tmpdir / "stream.txt"
             stream_file.write_text("# stream\n\nLine 1\nLine 2\n")
 
-            with patch("bot.LOG_DIR", tmpdir):
+            with patch("bot.DATA_DIR", tmpdir):
                 result = tool_stream_replace("Nonexistent line", "New")
                 assert "Error" in result
                 assert "not found" in result
@@ -358,7 +326,7 @@ class TestToolStreamReplace:
             stream_file = tmpdir / "stream.txt"
             stream_file.write_text("# stream\n\nDuplicate\nDuplicate\n")
 
-            with patch("bot.LOG_DIR", tmpdir):
+            with patch("bot.DATA_DIR", tmpdir):
                 result = tool_stream_replace("Duplicate", "New")
                 assert "Error" in result
                 assert "2 times" in result
@@ -372,7 +340,7 @@ class TestToolStreamReplace:
             lines[10] = "Old text to replace"  # Line 10 - outside last 100
             stream_file.write_text("\n".join(lines))
 
-            with patch("bot.LOG_DIR", tmpdir):
+            with patch("bot.DATA_DIR", tmpdir):
                 result = tool_stream_replace("Old text to replace", "New text")
                 assert "Error" in result
                 assert "not found in last 100" in result
@@ -386,7 +354,7 @@ class TestToolStreamReplace:
             lines[140] = "Text to replace"  # Line 140 - inside last 100
             stream_file.write_text("\n".join(lines))
 
-            with patch("bot.LOG_DIR", tmpdir):
+            with patch("bot.DATA_DIR", tmpdir):
                 result = tool_stream_replace("Text to replace", "Replaced text")
                 assert "Replaced" in result
                 content = stream_file.read_text()

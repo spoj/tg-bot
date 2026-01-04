@@ -22,6 +22,15 @@ import litellm
 litellm.disable_aiohttp_transport = True
 
 from models import REASONING, reasoning_complete, vision_complete, search_complete
+from prompts import (
+    IMAGE_DESCRIBE,
+    IMAGE_DESCRIBE_WITH_CAPTION,
+    AUDIO_TRANSCRIBE,
+    PDF_SUMMARIZE,
+    ASK_STREAM_FILE,
+    SYSTEM_PROMPT,
+    DEFAULT_SYSTEM_PROMPT,
+)
 from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -39,7 +48,6 @@ TOKEN = os.environ["TG_BOT_TOKEN"]
 ALLOWED_USERS = {int(x) for x in os.environ.get("ALLOWED_USERS", "").split(",") if x}
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path.home() / "life"))
-AGENTS_MD = Path(__file__).parent / "AGENTS.md"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 WAKEUPS_FILE = DATA_DIR / "wakeups.json"
 
@@ -321,36 +329,9 @@ TOOLS = [
 ]
 
 
-def extract_system_prompt() -> str:
-    """Extract system prompt from AGENTS.md (excluding Tools section)."""
-    if not AGENTS_MD.exists():
-        return f"You are a helpful assistant. Your owner is {OWNER_NAME}."
-
-    content = AGENTS_MD.read_text()
-
-    # Skip the Tools section (bot has its own tool implementations)
-    lines = content.split("\n")
-    result = []
-    skip_until_next_h2 = False
-
-    for line in lines:
-        if line.startswith("## Tools (terminal)"):
-            skip_until_next_h2 = True
-            continue
-        if line.startswith("## ") and skip_until_next_h2:
-            skip_until_next_h2 = False
-        if not skip_until_next_h2:
-            result.append(line)
-
-    base_prompt = "\n".join(result).strip()
-
-    return f"""{base_prompt}
-
----
-Environment: Telegram
-Output format: HTML (required)
-
-Your owner is {OWNER_NAME}. When logging items requested by someone other than the owner, always note who requested it (e.g. "TODO: Pick up groceries (someone added)")."""
+def get_system_prompt() -> str:
+    """Get the system prompt with owner name substituted."""
+    return SYSTEM_PROMPT.format(owner_name=OWNER_NAME)
 
 
 def get_session(chat_id: int) -> list[dict]:
@@ -641,7 +622,7 @@ async def _ask_file_pair(query: str, files: list[Path]) -> tuple[str, str]:
             messages=[
                 {
                     "role": "user",
-                    "content": f"Answer this question based on the log file content. Be concise. If the information is not in the log, say 'Not found in this log.'\n\nLog content:\n{content}\n\nQuestion: {query}",
+                    "content": ASK_STREAM_FILE.format(content=content, query=query),
                 }
             ],
         )
@@ -1102,9 +1083,10 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
 
 async def preprocess_image(file_path: str, caption: str = "") -> str | None:
     """Describe image using Gemini - detailed description."""
-    prompt = "Describe this image in detail. Include all visible text, numbers, labels, and notable visual elements."
     if caption:
-        prompt = f"The user sent this image with caption: '{caption}'. Describe what you see in detail, including all visible text, numbers, and labels."
+        prompt = IMAGE_DESCRIBE_WITH_CAPTION.format(caption=caption)
+    else:
+        prompt = IMAGE_DESCRIBE
 
     try:
         print(f"[preprocess_image] Processing {file_path}", flush=True)
@@ -1152,7 +1134,7 @@ async def preprocess_audio(file_path: str) -> str | None:
                     "content": [
                         {
                             "type": "text",
-                            "text": "Transcribe this audio exactly and completely. Output only the transcript, nothing else.",
+                            "text": AUDIO_TRANSCRIBE,
                         },
                         {
                             "type": "file",
@@ -1186,7 +1168,7 @@ async def preprocess_pdf(file_path: str) -> str | None:
                     "content": [
                         {
                             "type": "text",
-                            "text": "Briefly summarize this PDF document. Include: page count, document type/purpose, key dates, amounts, names, and main points. Keep it concise (2-4 sentences).",
+                            "text": PDF_SUMMARIZE,
                         },
                         {
                             "type": "file",
@@ -1217,7 +1199,7 @@ async def run_agent(
     interrupt: asyncio.Event | None = None,
 ) -> str | None:
     """Run the Opus agent loop with tools. Returns None if interrupted."""
-    system_prompt = extract_system_prompt()
+    system_prompt = get_system_prompt()
     history = get_session(chat_id)
 
     # Inject time and user identity into the current user message
