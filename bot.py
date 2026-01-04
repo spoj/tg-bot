@@ -623,25 +623,6 @@ def tool_stream_replace(from_text: str, to_text: str) -> str:
     return f"Replaced. Last {tail_count} lines:\n" + "\n".join(tail)
 
 
-async def _ask_single_log(query: str, log_path: Path) -> tuple[str, str]:
-    """Query a single log file with Gemini. Returns (filename, answer)."""
-    try:
-        content = log_path.read_text()
-        response = await vision_complete(
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Answer this question based on the log file content. Be concise. If the information is not in the log, say 'Not found in this log.'\n\nLog content:\n{content}\n\nQuestion: {query}",
-                }
-            ],
-        )
-        return (log_path.name, response.choices[0].message.content.strip())
-    except asyncio.TimeoutError:
-        return (log_path.name, "Timeout querying this log")
-    except Exception as e:
-        return (log_path.name, f"Error: {e}")
-
-
 def log_access(query: str, source: str = "tg") -> None:
     """Append query to ACCESS.log for dream-time analysis."""
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -651,21 +632,49 @@ def log_access(query: str, source: str = "tg") -> None:
         f.write(line)
 
 
+async def _ask_file_pair(query: str, files: list[Path]) -> tuple[str, str]:
+    """Query one or two files together. Returns (label, answer)."""
+    label = "+".join(f.name for f in files)
+    try:
+        content = "\n\n".join(f"--- {f.name} ---\n{f.read_text()}" for f in files)
+        response = await vision_complete(
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Answer this question based on the log file content. Be concise. If the information is not in the log, say 'Not found in this log.'\n\nLog content:\n{content}\n\nQuestion: {query}",
+                }
+            ],
+        )
+        return (label, response.choices[0].message.content.strip())
+    except asyncio.TimeoutError:
+        return (label, "Timeout querying this log")
+    except Exception as e:
+        return (label, f"Error: {e}")
+
+
 async def tool_ask_stream(query: str) -> str:
-    """Query all stream*.txt files in parallel."""
+    """Query all stream*.txt files in parallel with overlapping pairs."""
     log_access(query, "tg")
-    stream_files = list(DATA_DIR.glob("stream*.txt"))
+    stream_files = sorted(DATA_DIR.glob("stream*.txt"), key=lambda f: f.name)
     if not stream_files:
         return "No stream files found."
 
+    # Create overlapping pairs: (1,2), (2,3), (3,4)... or just single if only one file
+    if len(stream_files) == 1:
+        pairs = [stream_files]
+    else:
+        pairs = [
+            [stream_files[i], stream_files[i + 1]] for i in range(len(stream_files) - 1)
+        ]
+
     # Run queries in parallel with asyncio.gather
-    results = await asyncio.gather(*[_ask_single_log(query, f) for f in stream_files])
+    results = await asyncio.gather(*[_ask_file_pair(query, pair) for pair in pairs])
 
     # Format results
     output = []
-    for filename, answer in results:
+    for label, answer in results:
         if "Not found" not in answer:
-            output.append(f"**{filename}**: {answer}")
+            output.append(f"**{label}**: {answer}")
 
     if not output:
         return "No relevant information found in any stream files."
