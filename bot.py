@@ -347,6 +347,8 @@ def extract_system_prompt() -> str:
     return f"""{base_prompt}
 
 ---
+Environment: Telegram
+Output format: HTML (required)
 
 Your owner is {OWNER_NAME}. When logging items requested by someone other than the owner, always note who requested it (e.g. "TODO: Pick up groceries (someone added)")."""
 
