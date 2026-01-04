@@ -17,10 +17,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 import litellm
-from litellm import acompletion
 
 # Force httpx transport for SOCKS proxy support (aiohttp doesn't handle SOCKS properly)
 litellm.disable_aiohttp_transport = True
+
+from models import REASONING, reasoning_complete, vision_complete, search_complete
 from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -70,10 +71,6 @@ _bot = None
 # In-memory sessions: {chat_id: {"messages": [...], "last_used": timestamp}}
 sessions: dict[int, dict] = {}
 
-# LiteLLM model config
-AGENT_MODEL = os.environ.get("AGENT_MODEL", "openrouter/anthropic/claude-opus-4.5")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini/gemini-3-flash-preview")
-SEARCH_MODEL = os.environ.get("SEARCH_MODEL", "openrouter/x-ai/grok-4.1-fast")
 
 # Tool definitions for Opus
 TOOLS = [
@@ -628,15 +625,13 @@ async def _ask_single_log(query: str, log_path: Path) -> tuple[str, str]:
     """Query a single log file with Gemini. Returns (filename, answer)."""
     try:
         content = log_path.read_text()
-        response = await acompletion(
-            model=GEMINI_MODEL,
+        response = await vision_complete(
             messages=[
                 {
                     "role": "user",
                     "content": f"Answer this question based on the log file content. Be concise. If the information is not in the log, say 'Not found in this log.'\n\nLog content:\n{content}\n\nQuestion: {query}",
                 }
             ],
-            timeout=120,
         )
         return (log_path.name, response.choices[0].message.content.strip())
     except asyncio.TimeoutError:
@@ -679,11 +674,9 @@ async def tool_ask_stream(query: str) -> str:
 async def tool_web_search(query: str) -> str:
     """Web search using Grok online via OpenRouter."""
     try:
-        response = await acompletion(
-            model=SEARCH_MODEL,
+        response = await search_complete(
             messages=[{"role": "user", "content": query}],
-            timeout=600,  # 10 min timeout for grok
-            extra_body={"plugins": [{"id": "web"}]},  # OpenRouter web search plugin
+            extra_body={"plugins": [{"id": "web"}]},
         )
         return response.choices[0].message.content.strip()
     except asyncio.TimeoutError:
@@ -929,10 +922,8 @@ async def tool_ask_attachment(attachment_id: str, question: str) -> str:
         else:
             return f"Error: Unsupported attachment type: {attachment_type}"
 
-        response = await acompletion(
-            model=GEMINI_MODEL,
+        response = await vision_complete(
             messages=[{"role": "user", "content": content}],
-            timeout=120,
         )
         result = response.choices[0].message.content.strip()
         return result if result else "No response from analysis"
@@ -1110,8 +1101,7 @@ async def preprocess_image(file_path: str, caption: str = "") -> str | None:
         b64 = base64.b64encode(image_bytes).decode()
         mime_type = get_mime_type(Path(file_path))
 
-        response = await acompletion(
-            model=GEMINI_MODEL,
+        response = await vision_complete(
             messages=[
                 {
                     "role": "user",
@@ -1144,8 +1134,7 @@ async def preprocess_audio(file_path: str) -> str | None:
         b64 = base64.b64encode(audio_bytes).decode()
         mime_type = get_mime_type(Path(file_path))
 
-        response = await acompletion(
-            model=GEMINI_MODEL,
+        response = await vision_complete(
             messages=[
                 {
                     "role": "user",
@@ -1161,7 +1150,6 @@ async def preprocess_audio(file_path: str) -> str | None:
                     ],
                 }
             ],
-            timeout=120,  # Longer timeout for audio
         )
         result = response.choices[0].message.content.strip()
         if result:
@@ -1180,8 +1168,7 @@ async def preprocess_pdf(file_path: str) -> str | None:
         pdf_bytes = Path(file_path).read_bytes()
         b64 = base64.b64encode(pdf_bytes).decode()
 
-        response = await acompletion(
-            model=GEMINI_MODEL,
+        response = await vision_complete(
             messages=[
                 {
                     "role": "user",
@@ -1264,14 +1251,10 @@ async def run_agent(
         )
 
         try:
-            response = await acompletion(
-                model=AGENT_MODEL,
+            response = await reasoning_complete(
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="auto",
-                timeout=120,
-                max_tokens=16000,
-                reasoning={"effort": "high"},
             )
         except Exception as e:
             print(f"[run_agent] API error: {e}", flush=True)
@@ -1774,7 +1757,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     print(f"Bot starting... allowed users: {ALLOWED_USERS or 'all'}")
-    print(f"Model: {AGENT_MODEL}")
+    print(f"Model: {REASONING['model']}")
     print(f"Session timeout: {SESSION_TIMEOUT // 3600}h")
     print(f"Scheduler interval: {SCHEDULER_INTERVAL}s")
     print(f"Attachments dir: {ATTACHMENTS_DIR}")

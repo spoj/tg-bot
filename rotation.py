@@ -7,11 +7,10 @@ import random
 from datetime import datetime
 from pathlib import Path
 
-from litellm import acompletion
+from models import reasoning_complete
 
-# Config (same env vars as bot.py)
+# Config
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path.home() / "life"))
-AGENT_MODEL = os.environ.get("AGENT_MODEL", "openrouter/anthropic/claude-opus-4.5")
 ROTATION_THRESHOLD = 100 * 1024  # 100kb
 ACCESS_SAMPLE_SIZE = 5
 
@@ -43,25 +42,44 @@ def sample_access_log(n: int = ACCESS_SAMPLE_SIZE) -> list[str]:
     return random.sample(queries, n)
 
 
-async def extract_commitments(content: str) -> str:
-    """Step 1: Extract open TODOs and calendar from content."""
-    response = await acompletion(
-        model=AGENT_MODEL,
+async def extract_commitments(content: str, rotation_date: str) -> str:
+    """Step 1: Extract open TODOs and calendar from content.
+
+    Args:
+        content: Full stream file content
+        rotation_date: ISO date string (YYYY-MM-DD) for filtering past events
+    """
+    response = await reasoning_complete(
         messages=[
             {
                 "role": "user",
-                "content": f"""Extract all open commitments from this stream file:
-- Open TODOs (lines starting with "TODO:" that are not marked with checkmark)
-- Calendar items (+cal entries)
+                "content": f"""Extract all open commitments from this stream file to carry forward to the new stream.
 
-Output in the same format as the original (plain text, one per line).
-If none found, output "None."
+IMPORTANT: The stream is append-only and chronological. Entries are added throughout the file as they happen, NOT just in a header section. You must scan the ENTIRE file.
+
+Extract:
+1. Open TODOs - lines starting with "TODO:" that are NOT marked with ✓
+2. Open Projects - longer-running work items, initiatives, or ongoing efforts that aren't discrete tasks
+   - Look for "### Projects" section headers
+   - Also look for project mentions throughout (e.g., "POC stage", "in progress", named initiatives)
+   - Skip completed/closed projects (marked ✓ or explicitly closed)
+3. Calendar items - ALL "+cal" entries that are still relevant:
+   - Recurring events (e.g., "+cal Saturdays...", "+cal Monthly...")
+   - Annual events (e.g., "+cal 05-07: birthday")
+   - Future dated events (date >= {rotation_date})
+   - Skip past one-time events (date < {rotation_date})
+
+Output format:
+- Group: TODOs first, then Projects, then Calendar
+- One item per line, preserve original format
+- For calendar: recurring first, then annual, then upcoming by date
+
+Today's date for reference: {rotation_date}
 
 Stream content:
 {content}""",
             }
         ],
-        timeout=600,
     )
     return response.choices[0].message.content.strip()
 
@@ -82,14 +100,28 @@ Recently queried topics (sample):
 {chr(10).join(f"- {q}" for q in access_sample)}
 """
 
-    response = await acompletion(
-        model=AGENT_MODEL,
+    response = await reasoning_complete(
         messages=[
             {
                 "role": "user",
-                "content": f"""Compare these two stream files and find connections, contradictions, or notable observations.
+                "content": f"""Compare these two stream files for dream time reflection.
 
-Note: There may be time gaps between these files that you're not seeing. That's okay - focus on what you can observe from these two.
+Context: This is a personal memory stream - append-only, chronological notes capturing thoughts, facts, events, and learnings. Entries include:
+- Facts and reference data (names, dates, account numbers)
+- Calendar events (+cal)
+- Tasks (TODO:) and completions (✓)
+- Corrections ([corrected]) and behavioral learnings ([model])
+- Ideas, conversations, moods
+
+Look for:
+- Factual contradictions (dates, names, numbers that don't match)
+- Stale information (things that have changed or resolved)
+- Threads that appear in both files (evolution, progress, or stagnation)
+- Patterns in behavior or topics
+- Missed connections (related things not linked)
+
+Note: There may be time gaps between files. Focus on what you can observe from these two.
+Be specific - cite line content, not just topics.
 {access_context}
 --- Stream from {fresh_date} (most recent) ---
 {fresh_content}
@@ -100,7 +132,6 @@ Note: There may be time gaps between these files that you're not seeing. That's 
 Observations:""",
             }
         ],
-        timeout=600,
     )
     return response.choices[0].message.content.strip()
 
@@ -109,20 +140,21 @@ async def synthesize(observations: list[str]) -> str:
     """Step 3: Combine pairwise observations into coherent findings."""
     numbered = "\n\n".join(f"[{i + 1}]\n{obs}" for i, obs in enumerate(observations))
 
-    response = await acompletion(
-        model=AGENT_MODEL,
+    response = await reasoning_complete(
         messages=[
             {
                 "role": "user",
-                "content": f"""Synthesize these pairwise observations into coherent findings.
+                "content": f"""Synthesize these pairwise observations into dream time findings.
 
-Look for:
-- Patterns across time
-- Contradictions or stale information
-- Loose threads worth noting
-- Evolution of ideas or situations
+These observations compared the current stream against older archives. Your job is to consolidate them into actionable findings for the agent's self-improvement.
 
-Keep it concise and actionable.
+Focus areas:
+- Data integrity: contradictions, outdated info, things needing [corrected] tags
+- Open threads: things mentioned but not resolved, patterns of avoidance
+- Behavioral patterns: what topics recur, what gets dropped, what's queried often
+- Connections: ideas that evolved, threads that link across time
+
+Be specific and cite content. Skip observations that are just "interesting" but not actionable.
 
 Observations from pairwise comparisons:
 {numbered}
@@ -130,7 +162,6 @@ Observations from pairwise comparisons:
 Synthesized findings:""",
             }
         ],
-        timeout=600,
     )
     return response.choices[0].message.content.strip()
 
@@ -187,7 +218,7 @@ async def rotate_stream(force: bool = False) -> str:
     # Step 1: Extract commitments
     print("[rotation] Extracting commitments...", flush=True)
     try:
-        commitments = await extract_commitments(fresh_content)
+        commitments = await extract_commitments(fresh_content, today)
     except Exception as e:
         print(f"[rotation] extract_commitments failed: {e}", flush=True)
         commitments = "(extraction failed)"
