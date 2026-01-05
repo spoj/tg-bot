@@ -9,7 +9,6 @@ import json
 import os
 import random
 import re
-import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -27,7 +26,6 @@ from prompts import (
     IMAGE_DESCRIBE_WITH_CAPTION,
     AUDIO_TRANSCRIBE,
     PDF_SUMMARIZE,
-    ASK_STREAM_FILE,
     SYSTEM_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
 )
@@ -68,10 +66,10 @@ OWNER_NAME = USER_NAMES.get(OWNER_ID, "User") if OWNER_ID else "User"
 SESSION_TIMEOUT = 60 * 60  # 1 hour
 MAX_TOOL_ITERATIONS = 50
 
-# Rotation config
-ROTATION_THRESHOLD = 100 * 1024  # 100kb
-ROTATION_HOUR = 4  # 4am
-_last_rotation_check: str | None = None
+# Memory config
+MEMORY_DB = DATA_DIR / "adaptive_memory.db"
+MEMORY_CONTEXT = 0
+MEMORY_CMD = Path.home() / ".cargo" / "bin" / "adaptive-memory"
 
 # Global bot reference for tools that need to send messages
 _bot = None
@@ -85,56 +83,14 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read_stream",
-            "description": "Read the entire current stream.txt file. Use this to understand recent context, tasks, and history.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_stream_tail",
-            "description": "Read the last n lines of stream.txt. Use for quick recent context without loading the full file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "n": {
-                        "type": "integer",
-                        "description": "Number of lines to read from the end (default 50)",
-                    }
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "append_stream",
-            "description": "Append raw text to the end of stream.txt. Does NOT add any formatting - appends exactly what you provide. You must include date headers (## YYYY-MM-DD), newlines, etc. yourself. Can append multiple lines at once. Use plain text without bullet prefixes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Raw text to append verbatim. Include newlines (\\n) for multiple lines. Example: '## 2025-01-15\\nFirst item\\nSecond item'",
-                    }
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_stream",
-            "description": "Search across all stream files (current and archived) for information. Use for historical queries like 'when did I last...', 'have I ever...', etc. Runs in parallel across all stream files.",
+            "name": "memory_search",
+            "description": "Search associative memory. Returns memories with IDs, text, and relevance scores. MUST call at least once per user message to get relevant background.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The question to ask about the stream history",
+                        "description": "Search query for memories",
                     }
                 },
                 "required": ["query"],
@@ -144,21 +100,77 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "stream_replace",
-            "description": "Replace text in the last 100 lines of stream.txt. Use for correcting recent entries, updating status, or fixing typos. The from_text must be complete lines (at least 1 full line) and must match exactly once within the 100-line window.",
+            "name": "memory_add",
+            "description": "Add a memory to long-term storage. MUST call after responding to log the interaction.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "from_text": {
+                    "text": {
                         "type": "string",
-                        "description": "The exact text to replace (must be complete lines, unique within last 100 lines)",
+                        "description": "Memory text to store",
                     },
-                    "to_text": {
+                    "source": {
                         "type": "string",
-                        "description": "The replacement text",
+                        "enum": ["user", "model", "online"],
+                        "description": "user=paraphrased from user, model=your synthesis/observation, online=web search result worth remembering",
                     },
                 },
-                "required": ["from_text", "to_text"],
+                "required": ["text", "source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_strengthen",
+            "description": "Strengthen associations between memories. Call with IDs of memories relevant to the current query after searching.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Memory IDs to strengthen relationships between (max 10)",
+                    }
+                },
+                "required": ["ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_tail",
+            "description": "Get the most recent memories. Use to see recent context without searching.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_list",
+            "description": "List memories by ID range. Use to retrieve specific memories by their IDs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_id": {
+                        "type": "integer",
+                        "description": "Start ID (inclusive)",
+                    },
+                    "to_id": {
+                        "type": "integer",
+                        "description": "End ID (inclusive)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default 50)",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -316,14 +328,6 @@ TOOLS = [
                 },
                 "required": ["attachment_id"],
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "rotate_stream",
-            "description": "Rotate stream.txt (archive current and reinitialize) with dream time analysis. Use when user requests rotation. This archives the current stream, extracts open commitments, analyzes patterns across archived streams, and creates a fresh stream with findings.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
 ]
@@ -499,113 +503,8 @@ def get_mime_type(file_path: Path) -> str:
 # --- Tool implementations ---
 
 
-def tool_read_stream() -> str:
-    """Read entire stream.txt."""
-    stream_file = DATA_DIR / "stream.txt"
-    if not stream_file.exists():
-        return "stream.txt does not exist yet."
-    return stream_file.read_text()
-
-
-def tool_read_stream_tail(n: int = 50) -> str:
-    """Read last n lines of stream.txt."""
-    stream_file = DATA_DIR / "stream.txt"
-    if not stream_file.exists():
-        return "stream.txt does not exist yet."
-    lines = stream_file.read_text().splitlines()
-    tail = lines[-n:] if len(lines) > n else lines
-    return "\n".join(tail)
-
-
-def tool_append_stream(text: str) -> str:
-    """Append raw text to stream.txt. Uses file locking. Returns last n+5 lines after append."""
-    stream_file = DATA_DIR / "stream.txt"
-    lock_file = DATA_DIR / ".stream.txt.lock"
-
-    with open(lock_file, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            if stream_file.exists():
-                content = stream_file.read_text()
-            else:
-                content = "# stream\n"
-
-            # Just append raw text with a leading newline to separate
-            # User request: simple append, trust model for spacing/newlines
-            if text:
-                content = content.rstrip("\n")
-                if not text.startswith("\n"):
-                    content += "\n"
-                content += text
-                stream_file.write_text(content)
-
-            # Return last n+5 lines where n is lines added
-            lines_added = text.count("\n") + 1
-            all_lines = content.splitlines()
-            tail_count = lines_added + 5
-            tail_lines = (
-                all_lines[-tail_count:] if len(all_lines) > tail_count else all_lines
-            )
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-
-    return f"Appended {len(text)} chars. Context:\n" + "\n".join(tail_lines)
-
-
-def tool_stream_replace(from_text: str, to_text: str) -> str:
-    """Replace text in the last 100 lines of stream.txt."""
-    stream_file = DATA_DIR / "stream.txt"
-    lock_file = DATA_DIR / ".stream.txt.lock"
-
-    if not stream_file.exists():
-        return "Error: stream.txt does not exist."
-
-    # Validate from_text has at least one full line
-    from_text = from_text.strip("\n")
-    if not from_text:
-        return "Error: from_text cannot be empty."
-    if "\n" not in from_text and len(from_text.strip()) < 3:
-        return "Error: from_text must be at least one meaningful line."
-
-    with open(lock_file, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            content = stream_file.read_text()
-            lines = content.split("\n")
-
-            # Get last 50 lines window
-            window_start = max(0, len(lines) - 50)
-            window_lines = lines[window_start:]
-            window_text = "\n".join(window_lines)
-
-            # Check for match in window
-            match_count = window_text.count(from_text)
-
-            if match_count == 0:
-                return "Error: from_text not found in last 50 lines."
-            if match_count > 1:
-                return f"Error: from_text found {match_count} times in last 50 lines - be more specific."
-
-            # Perform replacement only in window
-            new_window_text = window_text.replace(from_text, to_text, 1)
-            new_lines = lines[:window_start] + new_window_text.split("\n")
-            new_content = "\n".join(new_lines)
-
-            stream_file.write_text(new_content)
-
-            # Return last 50 lines as context
-            result_lines = new_content.split("\n")
-            tail_count = min(50, len(result_lines))
-            tail = result_lines[-tail_count:]
-
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-
-    return f"Replaced. Last {tail_count} lines:\n" + "\n".join(tail)
-
-
 def log_access(query: str, source: str = "tg") -> None:
-    """Append query to ACCESS.log for dream-time analysis."""
+    """Append query to ACCESS.log for analysis."""
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     access_log = DATA_DIR / "ACCESS.log"
     line = f'{timestamp} {source} "{query}"\n'
@@ -613,54 +512,321 @@ def log_access(query: str, source: str = "tg") -> None:
         f.write(line)
 
 
-async def _ask_file_pair(query: str, files: list[Path]) -> tuple[str, str]:
-    """Query one or two files together. Returns (label, answer)."""
-    label = "+".join(f.name for f in files)
-    try:
-        content = "\n\n".join(f"--- {f.name} ---\n{f.read_text()}" for f in files)
-        response = await vision_complete(
-            messages=[
-                {
-                    "role": "user",
-                    "content": ASK_STREAM_FILE.format(content=content, query=query),
-                }
-            ],
-        )
-        return (label, response.choices[0].message.content.strip())
-    except asyncio.TimeoutError:
-        return (label, "Timeout querying this log")
-    except Exception as e:
-        return (label, f"Error: {e}")
-
-
-async def tool_ask_stream(query: str) -> str:
-    """Query all stream*.txt files in parallel with overlapping pairs."""
+async def tool_memory_search(query: str) -> str:
+    """Search adaptive memory."""
     log_access(query, "tg")
-    stream_files = sorted(DATA_DIR.glob("stream*.txt"), key=lambda f: f.name)
-    if not stream_files:
-        return "No stream files found."
 
-    # Create overlapping pairs: (1,2), (2,3), (3,4)... or just single if only one file
-    if len(stream_files) == 1:
-        pairs = [stream_files]
-    else:
-        pairs = [
-            [stream_files[i], stream_files[i + 1]] for i in range(len(stream_files) - 1)
-        ]
+    cmd = [
+        str(MEMORY_CMD),
+        "search",
+        "--db",
+        str(MEMORY_DB),
+        "--context",
+        str(MEMORY_CONTEXT),
+        query,
+    ]
 
-    # Run queries in parallel with asyncio.gather
-    results = await asyncio.gather(*[_ask_file_pair(query, pair) for pair in pairs])
+    print(f"[memory_search] Running: {' '.join(cmd)}", flush=True)
 
-    # Format results
-    output = []
-    for label, answer in results:
-        if "Not found" not in answer:
-            output.append(f"**{label}**: {answer}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
 
-    if not output:
-        return "No relevant information found in any stream files."
+        print(
+            f"[memory_search] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
+            flush=True,
+        )
 
-    return "\n\n".join(output)
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip()
+            print(f"[memory_search] ERROR: {err_msg}", flush=True)
+            return f"Memory search error: {err_msg}"
+
+        result = json.loads(stdout.decode())
+        memories = result.get("memories", [])
+
+        print(
+            f"[memory_search] Found {len(memories)} memories for query='{query}'",
+            flush=True,
+        )
+
+        if not memories:
+            return "No memories found."
+
+        # Format for model consumption - full text, no truncation
+        lines = [f"Found {len(memories)} memories:"]
+        for mem in memories:
+            mem_id = mem.get("id", "?")
+            text = mem.get("text", "")
+            energy = mem.get("energy", 0)
+            source = mem.get("source", "")
+            source_tag = f" [{source}]" if source else ""
+            lines.append(f"  [{mem_id}]{source_tag} (e={energy:.2f}): {text}")
+
+        return "\n".join(lines)
+
+    except FileNotFoundError:
+        print("[memory_search] ERROR: adaptive-memory command not found", flush=True)
+        return "Error: adaptive-memory command not found"
+    except json.JSONDecodeError as e:
+        print(f"[memory_search] ERROR: JSON decode failed: {e}", flush=True)
+        return f"Error parsing memory search result: {e}"
+    except Exception as e:
+        print(f"[memory_search] ERROR: {type(e).__name__}: {e}", flush=True)
+        return f"Memory search error: {e}"
+
+
+async def tool_memory_add(text: str, source: str) -> str:
+    """Add memory to adaptive memory store."""
+    if source not in ("user", "model", "online"):
+        print(f"[memory_add] ERROR: Invalid source '{source}'", flush=True)
+        return f"Error: source must be 'user', 'model', or 'online', got '{source}'"
+
+    cmd = [
+        str(MEMORY_CMD),
+        "add",
+        "--db",
+        str(MEMORY_DB),
+        "-s",
+        source,
+        text,
+    ]
+
+    print(
+        f"[memory_add] Running: adaptive-memory add (source={source}, text={len(text)} chars)",
+        flush=True,
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        print(
+            f"[memory_add] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
+            flush=True,
+        )
+
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip()
+            print(f"[memory_add] ERROR: {err_msg}", flush=True)
+            return f"Memory add error: {err_msg}"
+
+        result = json.loads(stdout.decode())
+        mem = result.get("memory", {})
+        mem_id = mem.get("id", "?")
+
+        print(f"[memory_add] Success: memory_id={mem_id}", flush=True)
+        return f"Added memory {mem_id}"
+
+    except FileNotFoundError:
+        print("[memory_add] ERROR: adaptive-memory command not found", flush=True)
+        return "Error: adaptive-memory command not found"
+    except json.JSONDecodeError as e:
+        print(f"[memory_add] ERROR: JSON decode failed: {e}", flush=True)
+        return f"Error parsing memory add result: {e}"
+    except Exception as e:
+        print(f"[memory_add] ERROR: {type(e).__name__}: {e}", flush=True)
+        return f"Memory add error: {e}"
+
+
+async def tool_memory_strengthen(ids: list[int]) -> str:
+    """Strengthen relationships between memory IDs."""
+    if not ids:
+        print("[memory_strengthen] ERROR: No IDs provided", flush=True)
+        return "Error: No IDs provided"
+
+    if len(ids) > 10:
+        print(f"[memory_strengthen] ERROR: Too many IDs ({len(ids)} > 10)", flush=True)
+        return "Error: Maximum 10 IDs allowed"
+
+    ids_str = ",".join(str(i) for i in ids)
+    cmd = [
+        str(MEMORY_CMD),
+        "strengthen",
+        "--db",
+        str(MEMORY_DB),
+        ids_str,
+    ]
+
+    print(
+        f"[memory_strengthen] Running: adaptive-memory strengthen {ids_str}", flush=True
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        print(
+            f"[memory_strengthen] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
+            flush=True,
+        )
+
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip()
+            print(f"[memory_strengthen] ERROR: {err_msg}", flush=True)
+            return f"Memory strengthen error: {err_msg}"
+
+        result = json.loads(stdout.decode())
+        relationships = result.get("relationships", [])
+        event_count = result.get("event_count", 0)
+
+        print(
+            f"[memory_strengthen] Success: {len(relationships)} relationships, {event_count} events",
+            flush=True,
+        )
+        return f"Strengthened {len(relationships)} relationship(s), {event_count} event(s) recorded"
+
+    except FileNotFoundError:
+        print(
+            "[memory_strengthen] ERROR: adaptive-memory command not found", flush=True
+        )
+        return "Error: adaptive-memory command not found"
+    except json.JSONDecodeError as e:
+        print(f"[memory_strengthen] ERROR: JSON decode failed: {e}", flush=True)
+        return f"Error parsing strengthen result: {e}"
+    except Exception as e:
+        print(f"[memory_strengthen] ERROR: {type(e).__name__}: {e}", flush=True)
+        return f"Memory strengthen error: {e}"
+
+
+async def tool_memory_tail() -> str:
+    """Get the 50 most recent memories."""
+    cmd = [
+        str(MEMORY_CMD),
+        "tail",
+        "--db",
+        str(MEMORY_DB),
+        "50",
+    ]
+
+    print(f"[memory_tail] Running: adaptive-memory tail 50", flush=True)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        print(
+            f"[memory_tail] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
+            flush=True,
+        )
+
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip()
+            print(f"[memory_tail] ERROR: {err_msg}", flush=True)
+            return f"Memory tail error: {err_msg}"
+
+        result = json.loads(stdout.decode())
+        memories = result.get("memories", [])
+
+        print(f"[memory_tail] Got {len(memories)} recent memories", flush=True)
+
+        if not memories:
+            return "No memories found."
+
+        # Format for model consumption - full text, no truncation
+        # Reverse so oldest first, most recent last (chronological reading order)
+        lines = [f"Last {len(memories)} memories (oldest first):"]
+        for mem in reversed(memories):
+            mem_id = mem.get("id", "?")
+            text = mem.get("text", "")
+            source = mem.get("source", "")
+            source_tag = f" [{source}]" if source else ""
+            lines.append(f"  [{mem_id}]{source_tag}: {text}")
+
+        return "\n".join(lines)
+
+    except FileNotFoundError:
+        print("[memory_tail] ERROR: adaptive-memory command not found", flush=True)
+        return "Error: adaptive-memory command not found"
+    except json.JSONDecodeError as e:
+        print(f"[memory_tail] ERROR: JSON decode failed: {e}", flush=True)
+        return f"Error parsing memory tail result: {e}"
+    except Exception as e:
+        print(f"[memory_tail] ERROR: {type(e).__name__}: {e}", flush=True)
+        return f"Memory tail error: {e}"
+
+
+async def tool_memory_list(
+    from_id: int | None = None, to_id: int | None = None, limit: int = 50
+) -> str:
+    """List memories by ID range."""
+    cmd = [
+        str(MEMORY_CMD),
+        "list",
+        "--db",
+        str(MEMORY_DB),
+        "--limit",
+        str(limit),
+    ]
+    if from_id is not None:
+        cmd.extend(["--from", str(from_id)])
+    if to_id is not None:
+        cmd.extend(["--to", str(to_id)])
+
+    print(f"[memory_list] Running: {' '.join(cmd)}", flush=True)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        print(
+            f"[memory_list] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
+            flush=True,
+        )
+
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip()
+            print(f"[memory_list] ERROR: {err_msg}", flush=True)
+            return f"Memory list error: {err_msg}"
+
+        result = json.loads(stdout.decode())
+        memories = result.get("memories", [])
+
+        print(f"[memory_list] Got {len(memories)} memories", flush=True)
+
+        if not memories:
+            return "No memories found in range."
+
+        # Format for model consumption
+        lines = [f"Found {len(memories)} memories:"]
+        for mem in memories:
+            mem_id = mem.get("id", "?")
+            text = mem.get("text", "")
+            source = mem.get("source", "")
+            source_tag = f" [{source}]" if source else ""
+            lines.append(f"  [{mem_id}]{source_tag}: {text}")
+
+        return "\n".join(lines)
+
+    except FileNotFoundError:
+        print("[memory_list] ERROR: adaptive-memory command not found", flush=True)
+        return "Error: adaptive-memory command not found"
+    except json.JSONDecodeError as e:
+        print(f"[memory_list] ERROR: JSON decode failed: {e}", flush=True)
+        return f"Error parsing memory list result: {e}"
+    except Exception as e:
+        print(f"[memory_list] ERROR: {type(e).__name__}: {e}", flush=True)
+        return f"Memory list error: {e}"
 
 
 async def tool_web_search(query: str) -> str:
@@ -1031,9 +1197,21 @@ async def tool_send_attachment(
 
 async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     """Execute a tool and return result."""
-    # Async tools
-    if name == "ask_stream":
-        return await tool_ask_stream(args["query"])
+    # Async tools - memory
+    if name == "memory_search":
+        return await tool_memory_search(args["query"])
+    if name == "memory_add":
+        return await tool_memory_add(args["text"], args["source"])
+    if name == "memory_strengthen":
+        return await tool_memory_strengthen(args["ids"])
+    if name == "memory_tail":
+        return await tool_memory_tail()
+    if name == "memory_list":
+        return await tool_memory_list(
+            args.get("from_id"), args.get("to_id"), args.get("limit", 50)
+        )
+
+    # Async tools - other
     if name == "web_search":
         return await tool_web_search(args["query"])
     if name == "ask_attachment":
@@ -1042,20 +1220,9 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_send_attachment(
             args["attachment_id"], chat_id, args.get("caption")
         )
-    if name == "rotate_stream":
-        from rotation import rotate_stream
-
-        return await rotate_stream(force=True)
 
     # Sync tools - dispatch table
     dispatch = {
-        "read_stream": (tool_read_stream, lambda a, c: ()),
-        "read_stream_tail": (tool_read_stream_tail, lambda a, c: (a.get("n", 50),)),
-        "append_stream": (tool_append_stream, lambda a, c: (a["text"],)),
-        "stream_replace": (
-            tool_stream_replace,
-            lambda a, c: (a["from_text"], a["to_text"]),
-        ),
         "random_pick": (tool_random_pick, lambda a, c: (a["items"], a.get("n", 1))),
         "schedule_wakeup": (
             tool_schedule_wakeup,
@@ -1653,41 +1820,6 @@ async def scheduler_loop(app) -> None:
             # Save updated wakeups
             if to_process:
                 save_wakeups(remaining)
-
-            # Daily rotation check at ROTATION_HOUR (4am)
-            global _last_rotation_check
-            today = now.strftime("%Y-%m-%d")
-
-            if now.hour == ROTATION_HOUR and _last_rotation_check != today:
-                _last_rotation_check = today
-                stream_file = DATA_DIR / "stream.txt"
-
-                if (
-                    stream_file.exists()
-                    and stream_file.stat().st_size > ROTATION_THRESHOLD
-                ):
-                    print(
-                        "[scheduler] Stream exceeds threshold, starting rotation...",
-                        flush=True,
-                    )
-                    try:
-                        from rotation import rotate_stream
-
-                        result = await rotate_stream(force=True)
-
-                        # Notify owner
-                        if OWNER_ID:
-                            try:
-                                await bot.send_message(
-                                    chat_id=OWNER_ID, text=f"🔄 {result}"
-                                )
-                            except Exception as e:
-                                print(
-                                    f"[scheduler] Failed to notify owner: {e}",
-                                    flush=True,
-                                )
-                    except Exception as e:
-                        print(f"[scheduler] Rotation failed: {e}", flush=True)
 
             # Check for expired sessions
             now_ts = time.time()
