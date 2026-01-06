@@ -91,7 +91,15 @@ TOOLS = [
                     "query": {
                         "type": "string",
                         "description": "Search query for memories",
-                    }
+                    },
+                    "from_id": {
+                        "type": "integer",
+                        "description": "Filter results to memories with ID >= from_id (inclusive)",
+                    },
+                    "to_id": {
+                        "type": "integer",
+                        "description": "Filter results to memories with ID <= to_id (inclusive)",
+                    },
                 },
                 "required": ["query"],
             },
@@ -512,7 +520,9 @@ def log_access(query: str, source: str = "tg") -> None:
         f.write(line)
 
 
-async def tool_memory_search(query: str) -> str:
+async def tool_memory_search(
+    query: str, from_id: int | None = None, to_id: int | None = None
+) -> str:
     """Search adaptive memory."""
     log_access(query, "tg")
 
@@ -523,8 +533,12 @@ async def tool_memory_search(query: str) -> str:
         str(MEMORY_DB),
         "--context",
         str(MEMORY_CONTEXT),
-        query,
     ]
+    if from_id is not None:
+        cmd.extend(["--from", str(from_id)])
+    if to_id is not None:
+        cmd.extend(["--to", str(to_id)])
+    cmd.append(query)
 
     print(f"[memory_search] Running: {' '.join(cmd)}", flush=True)
 
@@ -702,16 +716,16 @@ async def tool_memory_strengthen(ids: list[int]) -> str:
 
 
 async def tool_memory_tail() -> str:
-    """Get the 50 most recent memories."""
+    """Get the 15 most recent memories."""
     cmd = [
         str(MEMORY_CMD),
         "tail",
         "--db",
         str(MEMORY_DB),
-        "50",
+        "15",
     ]
 
-    print(f"[memory_tail] Running: adaptive-memory tail 50", flush=True)
+    print(f"[memory_tail] Running: adaptive-memory tail 15", flush=True)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1199,7 +1213,9 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     """Execute a tool and return result."""
     # Async tools - memory
     if name == "memory_search":
-        return await tool_memory_search(args["query"])
+        return await tool_memory_search(
+            args["query"], args.get("from_id"), args.get("to_id")
+        )
     if name == "memory_add":
         return await tool_memory_add(args["text"], args["source"])
     if name == "memory_strengthen":
