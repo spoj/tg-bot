@@ -185,6 +185,36 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "memory_related",
+            "description": "Find memories related to seed IDs via graph traversal (Personalized PageRank). Use after memory_search to explore connections from specific memory IDs. Skips text search - purely graph-based.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Seed memory IDs to find related memories for",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default 10)",
+                    },
+                    "from_id": {
+                        "type": "integer",
+                        "description": "Filter results to memories with ID >= from_id (inclusive)",
+                    },
+                    "to_id": {
+                        "type": "integer",
+                        "description": "Filter results to memories with ID <= to_id (inclusive)",
+                    },
+                },
+                "required": ["ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "Search the web for current information. Use for weather, news, facts, recommendations, prices, etc.",
             "parameters": {
@@ -295,31 +325,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "list_attachments",
-            "description": "List attachments that have been sent. Filter by type or search descriptions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "description": "Optional: filter by type - 'image', 'voice', 'audio', 'pdf'",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Optional: search term to match against filenames or descriptions",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results to return (default 20)",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "send_attachment",
             "description": "Send an attachment back to the user. Can send images, audio files, PDFs, or any file from the attachments folder.",
             "parameters": {
@@ -327,7 +332,7 @@ TOOLS = [
                 "properties": {
                     "attachment_id": {
                         "type": "string",
-                        "description": "The attachment ID to send (from list_attachments or previous messages)",
+                        "description": "The attachment ID (from previous messages or memory search)",
                     },
                     "caption": {
                         "type": "string",
@@ -433,56 +438,24 @@ def save_attachment_from_bytes(data: bytes, ext: str) -> tuple[str, Path]:
     return attachment_id, dest_path
 
 
-def save_attachment_metadata(
-    attachment_id: str,
-    attachment_type: str,
-    description: str,
-    chat_id: int,
-    user_id: int,
-    original_filename: str | None = None,
-) -> None:
-    """Save attachment metadata to sidecar JSON file."""
-    # Find the attachment file to get extension
-    matches = list(ATTACHMENTS_DIR.glob(f"{attachment_id}.*"))
-    if not matches:
-        print(f"[attachment] Warning: No file found for {attachment_id}", flush=True)
-        return
-
-    ext = matches[0].suffix
-    metadata_path = ATTACHMENTS_DIR / f"{attachment_id}.json"
-
-    metadata = {
-        "id": attachment_id,
-        "type": attachment_type,
-        "extension": ext,
-        "original_filename": original_filename,
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "timestamp": datetime.now().isoformat(),
-        "description": description,
-    }
-
-    metadata_path.write_text(json.dumps(metadata, indent=2))
-    print(f"[attachment] Saved metadata for {attachment_id}", flush=True)
-
-
-def load_attachment_metadata(attachment_id: str) -> dict | None:
-    """Load attachment metadata from sidecar JSON file."""
-    metadata_path = ATTACHMENTS_DIR / f"{attachment_id}.json"
-    if not metadata_path.exists():
-        return None
-    try:
-        return json.loads(metadata_path.read_text())
-    except (json.JSONDecodeError, IOError):
-        return None
-
-
 def get_attachment_path(attachment_id: str) -> Path | None:
     """Get the path to an attachment file by ID."""
     matches = list(ATTACHMENTS_DIR.glob(f"{attachment_id}.*"))
-    # Filter out .json metadata files
+    # Filter out .json metadata files (legacy)
     matches = [m for m in matches if m.suffix != ".json"]
     return matches[0] if matches else None
+
+
+def get_attachment_type(file_path: Path) -> str:
+    """Infer attachment type from file extension."""
+    ext = file_path.suffix.lower()
+    if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+        return "image"
+    elif ext in (".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac"):
+        return "audio"
+    elif ext == ".pdf":
+        return "pdf"
+    return "unknown"
 
 
 def get_mime_type(file_path: Path) -> str:
@@ -560,35 +533,11 @@ async def tool_memory_search(
             print(f"[memory_search] ERROR: {err_msg}", flush=True)
             return f"Memory search error: {err_msg}"
 
-        result = json.loads(stdout.decode())
-        memories = result.get("memories", [])
-
-        print(
-            f"[memory_search] Found {len(memories)} memories for query='{query}'",
-            flush=True,
-        )
-
-        if not memories:
-            return "No memories found."
-
-        # Format for model consumption - full text, no truncation
-        lines = [f"Found {len(memories)} memories:"]
-        for mem in memories:
-            mem_id = mem.get("id", "?")
-            text = mem.get("text", "")
-            energy = mem.get("energy", 0)
-            source = mem.get("source", "")
-            source_tag = f" [{source}]" if source else ""
-            lines.append(f"  [{mem_id}]{source_tag} (e={energy:.2f}): {text}")
-
-        return "\n".join(lines)
+        return stdout.decode().strip()
 
     except FileNotFoundError:
         print("[memory_search] ERROR: adaptive-memory command not found", flush=True)
         return "Error: adaptive-memory command not found"
-    except json.JSONDecodeError as e:
-        print(f"[memory_search] ERROR: JSON decode failed: {e}", flush=True)
-        return f"Error parsing memory search result: {e}"
     except Exception as e:
         print(f"[memory_search] ERROR: {type(e).__name__}: {e}", flush=True)
         return f"Memory search error: {e}"
@@ -633,19 +582,11 @@ async def tool_memory_add(text: str, source: str) -> str:
             print(f"[memory_add] ERROR: {err_msg}", flush=True)
             return f"Memory add error: {err_msg}"
 
-        result = json.loads(stdout.decode())
-        mem = result.get("memory", {})
-        mem_id = mem.get("id", "?")
-
-        print(f"[memory_add] Success: memory_id={mem_id}", flush=True)
-        return f"Added memory {mem_id}"
+        return stdout.decode().strip()
 
     except FileNotFoundError:
         print("[memory_add] ERROR: adaptive-memory command not found", flush=True)
         return "Error: adaptive-memory command not found"
-    except json.JSONDecodeError as e:
-        print(f"[memory_add] ERROR: JSON decode failed: {e}", flush=True)
-        return f"Error parsing memory add result: {e}"
     except Exception as e:
         print(f"[memory_add] ERROR: {type(e).__name__}: {e}", flush=True)
         return f"Memory add error: {e}"
@@ -692,24 +633,13 @@ async def tool_memory_strengthen(ids: list[int]) -> str:
             print(f"[memory_strengthen] ERROR: {err_msg}", flush=True)
             return f"Memory strengthen error: {err_msg}"
 
-        result = json.loads(stdout.decode())
-        relationships = result.get("relationships", [])
-        event_count = result.get("event_count", 0)
-
-        print(
-            f"[memory_strengthen] Success: {len(relationships)} relationships, {event_count} events",
-            flush=True,
-        )
-        return f"Strengthened {len(relationships)} relationship(s), {event_count} event(s) recorded"
+        return stdout.decode().strip()
 
     except FileNotFoundError:
         print(
             "[memory_strengthen] ERROR: adaptive-memory command not found", flush=True
         )
         return "Error: adaptive-memory command not found"
-    except json.JSONDecodeError as e:
-        print(f"[memory_strengthen] ERROR: JSON decode failed: {e}", flush=True)
-        return f"Error parsing strengthen result: {e}"
     except Exception as e:
         print(f"[memory_strengthen] ERROR: {type(e).__name__}: {e}", flush=True)
         return f"Memory strengthen error: {e}"
@@ -745,32 +675,11 @@ async def tool_memory_tail() -> str:
             print(f"[memory_tail] ERROR: {err_msg}", flush=True)
             return f"Memory tail error: {err_msg}"
 
-        result = json.loads(stdout.decode())
-        memories = result.get("memories", [])
-
-        print(f"[memory_tail] Got {len(memories)} recent memories", flush=True)
-
-        if not memories:
-            return "No memories found."
-
-        # Format for model consumption - full text, no truncation
-        # Reverse so oldest first, most recent last (chronological reading order)
-        lines = [f"Last {len(memories)} memories (oldest first):"]
-        for mem in reversed(memories):
-            mem_id = mem.get("id", "?")
-            text = mem.get("text", "")
-            source = mem.get("source", "")
-            source_tag = f" [{source}]" if source else ""
-            lines.append(f"  [{mem_id}]{source_tag}: {text}")
-
-        return "\n".join(lines)
+        return stdout.decode().strip()
 
     except FileNotFoundError:
         print("[memory_tail] ERROR: adaptive-memory command not found", flush=True)
         return "Error: adaptive-memory command not found"
-    except json.JSONDecodeError as e:
-        print(f"[memory_tail] ERROR: JSON decode failed: {e}", flush=True)
-        return f"Error parsing memory tail result: {e}"
     except Exception as e:
         print(f"[memory_tail] ERROR: {type(e).__name__}: {e}", flush=True)
         return f"Memory tail error: {e}"
@@ -813,34 +722,71 @@ async def tool_memory_list(
             print(f"[memory_list] ERROR: {err_msg}", flush=True)
             return f"Memory list error: {err_msg}"
 
-        result = json.loads(stdout.decode())
-        memories = result.get("memories", [])
-
-        print(f"[memory_list] Got {len(memories)} memories", flush=True)
-
-        if not memories:
-            return "No memories found in range."
-
-        # Format for model consumption
-        lines = [f"Found {len(memories)} memories:"]
-        for mem in memories:
-            mem_id = mem.get("id", "?")
-            text = mem.get("text", "")
-            source = mem.get("source", "")
-            source_tag = f" [{source}]" if source else ""
-            lines.append(f"  [{mem_id}]{source_tag}: {text}")
-
-        return "\n".join(lines)
+        return stdout.decode().strip()
 
     except FileNotFoundError:
         print("[memory_list] ERROR: adaptive-memory command not found", flush=True)
         return "Error: adaptive-memory command not found"
-    except json.JSONDecodeError as e:
-        print(f"[memory_list] ERROR: JSON decode failed: {e}", flush=True)
-        return f"Error parsing memory list result: {e}"
     except Exception as e:
         print(f"[memory_list] ERROR: {type(e).__name__}: {e}", flush=True)
         return f"Memory list error: {e}"
+
+
+async def tool_memory_related(
+    ids: list[int],
+    limit: int = 10,
+    from_id: int | None = None,
+    to_id: int | None = None,
+) -> str:
+    """Find memories related to seed IDs via graph traversal."""
+    if not ids:
+        return "Error: No seed IDs provided"
+
+    ids_str = ",".join(str(i) for i in ids)
+    cmd = [
+        str(MEMORY_CMD),
+        "related",
+        "--db",
+        str(MEMORY_DB),
+        "--limit",
+        str(limit),
+        "--context",
+        str(MEMORY_CONTEXT),
+    ]
+    if from_id is not None:
+        cmd.extend(["--from", str(from_id)])
+    if to_id is not None:
+        cmd.extend(["--to", str(to_id)])
+    cmd.append(ids_str)
+
+    print(f"[memory_related] Running: {' '.join(cmd)}", flush=True)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        print(
+            f"[memory_related] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
+            flush=True,
+        )
+
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip()
+            print(f"[memory_related] ERROR: {err_msg}", flush=True)
+            return f"Memory related error: {err_msg}"
+
+        return stdout.decode().strip()
+
+    except FileNotFoundError:
+        print("[memory_related] ERROR: adaptive-memory command not found", flush=True)
+        return "Error: adaptive-memory command not found"
+    except Exception as e:
+        print(f"[memory_related] ERROR: {type(e).__name__}: {e}", flush=True)
+        return f"Memory related error: {e}"
 
 
 async def tool_web_search(query: str) -> str:
@@ -1055,11 +1001,7 @@ async def tool_ask_attachment(attachment_id: str, question: str) -> str:
     if not attachment_path:
         return f"Error: Attachment {attachment_id} not found"
 
-    metadata = load_attachment_metadata(attachment_id)
-    if not metadata:
-        return f"Error: Metadata for {attachment_id} not found"
-
-    attachment_type = metadata.get("type", "unknown")
+    attachment_type = get_attachment_type(attachment_path)
 
     try:
         file_bytes = attachment_path.read_bytes()
@@ -1105,69 +1047,6 @@ async def tool_ask_attachment(attachment_id: str, question: str) -> str:
         return f"Error analyzing attachment: {e}"
 
 
-def tool_list_attachments(
-    attachment_type: str | None = None,
-    query: str | None = None,
-    limit: int = 20,
-) -> str:
-    """List attachments, optionally filtered by type or search query."""
-    if not ATTACHMENTS_DIR.exists():
-        return "No attachments found."
-
-    # Find all metadata files
-    metadata_files = sorted(
-        ATTACHMENTS_DIR.glob("*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,  # Most recent first
-    )
-
-    results = []
-    for meta_path in metadata_files:
-        if len(results) >= limit:
-            break
-
-        try:
-            metadata = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, IOError):
-            continue
-
-        # Filter by type
-        if attachment_type and metadata.get("type") != attachment_type:
-            continue
-
-        # Filter by query (search in description and filename)
-        if query:
-            query_lower = query.lower()
-            description = (metadata.get("description") or "").lower()
-            filename = (metadata.get("original_filename") or "").lower()
-            if query_lower not in description and query_lower not in filename:
-                continue
-
-        # Format result
-        att_id = metadata.get("id", "unknown")
-        att_type = metadata.get("type", "unknown")
-        filename = metadata.get("original_filename")
-        timestamp = metadata.get("timestamp", "")[:10]  # Just date part
-        description = metadata.get("description", "")[:100]
-
-        if filename:
-            results.append(
-                f"{att_id} [{att_type}] {filename} ({timestamp}): {description}..."
-            )
-        else:
-            results.append(f"{att_id} [{att_type}] ({timestamp}): {description}...")
-
-    if not results:
-        if attachment_type:
-            return f"No {attachment_type} attachments found."
-        elif query:
-            return f"No attachments matching '{query}' found."
-        return "No attachments found."
-
-    header = f"Found {len(results)} attachment(s):\n"
-    return header + "\n".join(results)
-
-
 async def tool_send_attachment(
     attachment_id: str, chat_id: int, caption: str | None = None
 ) -> str:
@@ -1181,8 +1060,7 @@ async def tool_send_attachment(
     if not attachment_path:
         return f"Error: Attachment {attachment_id} not found"
 
-    metadata = load_attachment_metadata(attachment_id)
-    attachment_type = metadata.get("type", "unknown") if metadata else "unknown"
+    attachment_type = get_attachment_type(attachment_path)
 
     try:
         with open(attachment_path, "rb") as f:
@@ -1191,12 +1069,11 @@ async def tool_send_attachment(
             elif attachment_type in ("voice", "audio"):
                 await _bot.send_audio(chat_id=chat_id, audio=f, caption=caption)
             elif attachment_type == "pdf":
-                filename = metadata.get("original_filename") if metadata else None
                 await _bot.send_document(
                     chat_id=chat_id,
                     document=f,
                     caption=caption,
-                    filename=filename or f"{attachment_id}.pdf",
+                    filename=f"{attachment_id}.pdf",
                 )
             else:
                 # Generic document
@@ -1226,6 +1103,13 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_memory_list(
             args.get("from_id"), args.get("to_id"), args.get("limit", 50)
         )
+    if name == "memory_related":
+        return await tool_memory_related(
+            args["ids"],
+            args.get("limit", 10),
+            args.get("from_id"),
+            args.get("to_id"),
+        )
 
     # Async tools - other
     if name == "web_search":
@@ -1246,10 +1130,6 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         ),
         "list_wakeups": (tool_list_wakeups, lambda a, c: (c,)),
         "cancel_wakeup": (tool_cancel_wakeup, lambda a, c: (a["wakeup_id"], c)),
-        "list_attachments": (
-            tool_list_attachments,
-            lambda a, c: (a.get("type"), a.get("query"), a.get("limit", 20)),
-        ),
     }
 
     if name not in dispatch:
@@ -1391,10 +1271,19 @@ async def run_agent(
     user_name = USER_NAMES.get(user_id, "Unknown") if user_id else "Unknown"
     user_message = f"[{current_time}] [{user_name}] {user_message}"
 
-    # Build messages for API
+    # Build messages for API with cache control on the last user message
+    # This enables Anthropic prompt caching via OpenRouter (90% cost reduction on cache hits)
+    # Cache breakpoint on last user message = cache system + history + user message
+    # Tool loop iterations 2+ will hit cache, only paying for new tool results
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
+    messages.append(
+        {
+            "role": "user",
+            "content": user_message,
+            "cache_control": {"type": "ephemeral"},
+        }
+    )
 
     # Hash the history prefix for consistency verification
     history_hash = hash_messages(history) if history else "empty"
@@ -1436,6 +1325,18 @@ async def run_agent(
             print(f"[run_agent] API error: {e}", flush=True)
             # Return error to user
             return f"API error: {e}"
+
+        # Log cache stats from response usage
+        usage = getattr(response, "usage", None)
+        if usage:
+            cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            output_tokens = getattr(usage, "completion_tokens", 0) or 0
+            print(
+                f"[run_agent] tokens: in={input_tokens} out={output_tokens} cache_write={cache_create} cache_read={cache_read}",
+                flush=True,
+            )
 
         msg = response.choices[0].message
 
@@ -1587,16 +1488,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
             return None
-
-        # Save metadata
-        save_attachment_metadata(
-            attachment_id,
-            attachment_type,
-            description,
-            chat_id,
-            user_id,
-            original_filename,
-        )
 
         # Format message based on type
         if attachment_type == "voice":

@@ -4,8 +4,7 @@ from litellm import acompletion
 
 # --- Configs by Purpose ---
 REASONING = {
-    "model": "openrouter/anthropic/claude-opus-4.5",
-    "reasoning": {"effort": "high"},
+    "model": "gemini/gemini-3-flash-preview",
     "max_tokens": 16000,
     "timeout": 600,
 }
