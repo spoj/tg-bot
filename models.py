@@ -4,7 +4,8 @@ from litellm import acompletion
 
 # --- Configs by Purpose ---
 REASONING = {
-    "model": "gemini/gemini-3-flash-preview",
+    "model": "openrouter/anthropic/claude-opus-4.5",
+    "reasoning": {"effort": "high"},
     "max_tokens": 16000,
     "timeout": 600,
 }
@@ -18,6 +19,12 @@ VISION = {
 SEARCH = {
     "model": "openrouter/x-ai/grok-4.1-fast",
     "timeout": 600,
+}
+
+LONG_CONTEXT = {
+    "model": "gemini/gemini-3-pro-preview",
+    "max_tokens": 8000,
+    "timeout": 300,
 }
 
 
@@ -38,5 +45,12 @@ async def vision_complete(messages: list, **kwargs):
 async def search_complete(messages: list, **kwargs):
     """For web search queries."""
     config = SEARCH.copy()
+    config.update(kwargs)
+    return await acompletion(messages=messages, **config)
+
+
+async def long_context_complete(messages: list, **kwargs):
+    """For long context queries (e.g., searching large files)."""
+    config = LONG_CONTEXT.copy()
     config.update(kwargs)
     return await acompletion(messages=messages, **config)

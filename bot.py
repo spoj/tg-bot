@@ -20,7 +20,13 @@ import litellm
 # Force httpx transport for SOCKS proxy support (aiohttp doesn't handle SOCKS properly)
 litellm.disable_aiohttp_transport = True
 
-from models import REASONING, reasoning_complete, vision_complete, search_complete
+from models import (
+    REASONING,
+    reasoning_complete,
+    vision_complete,
+    search_complete,
+    long_context_complete,
+)
 from prompts import (
     IMAGE_DESCRIBE,
     IMAGE_DESCRIBE_WITH_CAPTION,
@@ -66,10 +72,9 @@ OWNER_NAME = USER_NAMES.get(OWNER_ID, "User") if OWNER_ID else "User"
 SESSION_TIMEOUT = 60 * 60  # 1 hour
 MAX_TOOL_ITERATIONS = 50
 
-# Memory config
-MEMORY_DB = DATA_DIR / "adaptive_memory.db"
-MEMORY_CONTEXT = 0
-MEMORY_CMD = Path.home() / ".cargo" / "bin" / "adaptive-memory"
+# Stream config
+STREAM_FILE = DATA_DIR / "stream.txt"
+STREAM_LOCK = DATA_DIR / ".stream.txt.lock"
 
 # Global bot reference for tools that need to send messages
 _bot = None
@@ -83,73 +88,84 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "memory_search",
-            "description": "Search associative memory. Returns memories with IDs, text, and relevance scores. MUST call at least once per user message to get relevant background.",
+            "name": "stream_tail",
+            "description": "Read the last n lines of stream.txt. MUST call at the start of every new session to load recent context.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query for memories",
-                    },
-                    "from_id": {
+                    "n": {
                         "type": "integer",
-                        "description": "Filter results to memories with ID >= from_id (inclusive)",
-                    },
-                    "to_id": {
-                        "type": "integer",
-                        "description": "Filter results to memories with ID <= to_id (inclusive)",
-                    },
+                        "description": "Number of lines to read from the end (default 50)",
+                    }
                 },
-                "required": ["query"],
+                "required": [],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "memory_add",
-            "description": "Add a memory to long-term storage. MUST call after responding to log the interaction.",
+            "name": "stream_range",
+            "description": "Read a specific range of lines from stream.txt (1-indexed, inclusive). Use with stream_timeline to navigate to specific dates.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_line": {
+                        "type": "integer",
+                        "description": "Start line number (1-indexed, inclusive)",
+                    },
+                    "to_line": {
+                        "type": "integer",
+                        "description": "End line number (1-indexed, inclusive)",
+                    },
+                },
+                "required": ["from_line", "to_line"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stream_append",
+            "description": "Append raw text to the end of stream.txt. You control formatting - include date headers (# YYYY-MM-DD), newlines, tags as needed. MUST call after every response to log the interaction.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "Memory text to store",
-                    },
-                    "source": {
-                        "type": "string",
-                        "enum": ["user", "model", "online"],
-                        "description": "user=paraphrased from user, model=your synthesis/observation, online=web search result worth remembering",
-                    },
+                        "description": "Raw text to append. Include newlines (\\n) for multiple lines.",
+                    }
                 },
-                "required": ["text", "source"],
+                "required": ["text"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "memory_strengthen",
-            "description": "Strengthen associations between memories. Call with IDs of memories relevant to the current query after searching.",
+            "name": "stream_replace",
+            "description": "Replace complete line(s) in the last 50 lines of stream.txt. The from_text must match one or more complete lines exactly once. Partial line matches are rejected.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Memory IDs to strengthen relationships between (max 10)",
-                    }
+                    "from_text": {
+                        "type": "string",
+                        "description": "The exact complete line(s) to replace (must match full lines, unique within last 50 lines)",
+                    },
+                    "to_text": {
+                        "type": "string",
+                        "description": "The replacement text",
+                    },
                 },
-                "required": ["ids"],
+                "required": ["from_text", "to_text"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "memory_tail",
-            "description": "Get the most recent memories. Use to see recent context without searching.",
+            "name": "stream_timeline",
+            "description": "Get line ranges for each date header (# YYYY-MM-DD) in stream.txt. Use to navigate to specific dates with stream_range.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -160,55 +176,17 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "memory_list",
-            "description": "List memories by ID range. Use to retrieve specific memories by their IDs.",
+            "name": "ask_stream",
+            "description": "Ask a question about the entire stream.txt file. Uses a long-context model to search/analyze the full file. Use for queries like 'when did I last...', 'have I ever...', 'find all mentions of...', etc.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "from_id": {
-                        "type": "integer",
-                        "description": "Start ID (inclusive)",
-                    },
-                    "to_id": {
-                        "type": "integer",
-                        "description": "End ID (inclusive)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default 50)",
-                    },
+                    "query": {
+                        "type": "string",
+                        "description": "The question to ask about the stream history",
+                    }
                 },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "memory_related",
-            "description": "Find memories related to seed IDs via graph traversal (Personalized PageRank). Use after memory_search to explore connections from specific memory IDs. Skips text search - purely graph-based.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Seed memory IDs to find related memories for",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default 10)",
-                    },
-                    "from_id": {
-                        "type": "integer",
-                        "description": "Filter results to memories with ID >= from_id (inclusive)",
-                    },
-                    "to_id": {
-                        "type": "integer",
-                        "description": "Filter results to memories with ID <= to_id (inclusive)",
-                    },
-                },
-                "required": ["ids"],
+                "required": ["query"],
             },
         },
     },
@@ -484,309 +462,238 @@ def get_mime_type(file_path: Path) -> str:
 # --- Tool implementations ---
 
 
-def log_access(query: str, source: str = "tg") -> None:
-    """Append query to ACCESS.log for analysis."""
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    access_log = DATA_DIR / "ACCESS.log"
-    line = f'{timestamp} {source} "{query}"\n'
-    with open(access_log, "a") as f:
-        f.write(line)
+# --- Stream tool implementations ---
 
 
-async def tool_memory_search(
-    query: str, from_id: int | None = None, to_id: int | None = None
-) -> str:
-    """Search adaptive memory."""
-    log_access(query, "tg")
-
-    cmd = [
-        str(MEMORY_CMD),
-        "search",
-        "--db",
-        str(MEMORY_DB),
-        "--context",
-        str(MEMORY_CONTEXT),
-    ]
-    if from_id is not None:
-        cmd.extend(["--from", str(from_id)])
-    if to_id is not None:
-        cmd.extend(["--to", str(to_id)])
-    cmd.append(query)
-
-    print(f"[memory_search] Running: {' '.join(cmd)}", flush=True)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-
-        print(
-            f"[memory_search] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
-            flush=True,
-        )
-
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip()
-            print(f"[memory_search] ERROR: {err_msg}", flush=True)
-            return f"Memory search error: {err_msg}"
-
-        return stdout.decode().strip()
-
-    except FileNotFoundError:
-        print("[memory_search] ERROR: adaptive-memory command not found", flush=True)
-        return "Error: adaptive-memory command not found"
-    except Exception as e:
-        print(f"[memory_search] ERROR: {type(e).__name__}: {e}", flush=True)
-        return f"Memory search error: {e}"
+def _read_stream_lines() -> list[str]:
+    """Read stream.txt and return lines. Auto-creates if doesn't exist."""
+    if not STREAM_FILE.exists():
+        today = datetime.now().strftime("%Y-%m-%d")
+        STREAM_FILE.write_text(f"# {today}\n")
+    return STREAM_FILE.read_text().splitlines()
 
 
-async def tool_memory_add(text: str, source: str) -> str:
-    """Add memory to adaptive memory store."""
-    if source not in ("user", "model", "online"):
-        print(f"[memory_add] ERROR: Invalid source '{source}'", flush=True)
-        return f"Error: source must be 'user', 'model', or 'online', got '{source}'"
+def _format_lines(lines: list[str], start_line: int, total: int) -> str:
+    """Format lines with line numbers (1-indexed) and header."""
+    end_line = start_line + len(lines) - 1
+    header = f"Lines {start_line}-{end_line} (total: {total}):"
+    numbered = [f"{start_line + i}\t{line}" for i, line in enumerate(lines)]
+    return header + "\n" + "\n".join(numbered)
 
-    cmd = [
-        str(MEMORY_CMD),
-        "add",
-        "--db",
-        str(MEMORY_DB),
-        "-s",
-        source,
-        text,
-    ]
 
-    print(
-        f"[memory_add] Running: adaptive-memory add (source={source}, text={len(text)} chars)",
-        flush=True,
+def tool_stream_tail(n: int = 50) -> str:
+    """Read last n lines of stream.txt."""
+    if n <= 0:
+        return "Error: n must be positive."
+
+    lines = _read_stream_lines()
+    total = len(lines)
+
+    if total == 0:
+        return "Lines 0-0 (total: 0):\n(empty file)"
+
+    tail_lines = lines[-n:] if len(lines) > n else lines
+    start_line = total - len(tail_lines) + 1  # 1-indexed
+
+    return _format_lines(tail_lines, start_line, total)
+
+
+def tool_stream_range(from_line: int, to_line: int) -> str:
+    """Read a specific range of lines (1-indexed, inclusive)."""
+    lines = _read_stream_lines()
+    total = len(lines)
+
+    if total == 0:
+        return "Lines 0-0 (total: 0):\n(empty file)"
+
+    # Swap if from > to
+    if from_line > to_line:
+        from_line, to_line = to_line, from_line
+
+    # Store original request for error message
+    orig_from, orig_to = from_line, to_line
+
+    # Clamp to valid range
+    from_line = max(1, from_line)
+    to_line = min(total, to_line)
+
+    if from_line > total:
+        return f"Lines {orig_from}-{orig_from} (requested {orig_from}-{orig_to}, total: {total}):\n(out of range)"
+
+    # Convert to 0-indexed for slicing
+    selected = lines[from_line - 1 : to_line]
+
+    if not selected:
+        return f"Lines {from_line}-{to_line} (total: {total}):\n(no lines in range)"
+
+    return _format_lines(selected, from_line, total)
+
+
+def tool_stream_append(text: str) -> str:
+    """Append raw text to stream.txt with file locking."""
+    if not text:
+        return "Error: text cannot be empty."
+
+    with open(STREAM_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if STREAM_FILE.exists():
+                content = STREAM_FILE.read_text()
+            else:
+                today = datetime.now().strftime("%Y-%m-%d")
+                content = f"# {today}\n"
+
+            # Append: strip trailing newline from original, add newline if text doesn't start with one
+            content = content.rstrip("\n")
+            if not text.startswith("\n"):
+                content += "\n"
+            content += text
+            STREAM_FILE.write_text(content)
+
+            # Return context: last n+5 lines where n is lines added
+            lines = content.splitlines()
+            total = len(lines)
+            lines_added = text.count("\n") + 1
+            tail_count = lines_added + 5
+            tail_lines = lines[-tail_count:] if len(lines) > tail_count else lines
+            start_line = total - len(tail_lines) + 1
+
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+    return f"Appended {len(text)} chars. " + _format_lines(
+        tail_lines, start_line, total
     )
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
 
-        print(
-            f"[memory_add] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
-            flush=True,
-        )
+def tool_stream_replace(from_text: str, to_text: str) -> str:
+    """Replace text in the last 50 lines of stream.txt. Must match complete lines."""
+    if not STREAM_FILE.exists():
+        return "Error: stream.txt does not exist."
 
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip()
-            print(f"[memory_add] ERROR: {err_msg}", flush=True)
-            return f"Memory add error: {err_msg}"
+    # Validate from_text - must be non-empty
+    from_text_stripped = from_text.strip("\n")
+    if not from_text_stripped:
+        return "Error: from_text cannot be empty."
 
-        return stdout.decode().strip()
+    with open(STREAM_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            content = STREAM_FILE.read_text()
+            lines = content.split("\n")
+            total_before = len(lines)
 
-    except FileNotFoundError:
-        print("[memory_add] ERROR: adaptive-memory command not found", flush=True)
-        return "Error: adaptive-memory command not found"
-    except Exception as e:
-        print(f"[memory_add] ERROR: {type(e).__name__}: {e}", flush=True)
-        return f"Memory add error: {e}"
+            # Get last 50 lines window
+            window_size = 50
+            window_start = max(0, len(lines) - window_size)
+            window_lines = lines[window_start:]
 
+            # Validate from_text matches complete lines
+            # Split from_text into lines and check each exists as a complete line
+            from_lines = from_text.strip("\n").split("\n")
 
-async def tool_memory_strengthen(ids: list[int]) -> str:
-    """Strengthen relationships between memory IDs."""
-    if not ids:
-        print("[memory_strengthen] ERROR: No IDs provided", flush=True)
-        return "Error: No IDs provided"
+            # Find where the sequence of lines starts in the window
+            match_indices = []
+            for i in range(len(window_lines) - len(from_lines) + 1):
+                if window_lines[i : i + len(from_lines)] == from_lines:
+                    match_indices.append(i)
 
-    if len(ids) > 10:
-        print(f"[memory_strengthen] ERROR: Too many IDs ({len(ids)} > 10)", flush=True)
-        return "Error: Maximum 10 IDs allowed"
+            if len(match_indices) == 0:
+                return f"Error: from_text not found as complete line(s) in last {window_size} lines."
+            if len(match_indices) > 1:
+                return f"Error: from_text found {len(match_indices)} times in last {window_size} lines - be more specific."
 
-    ids_str = ",".join(str(i) for i in ids)
-    cmd = [
-        str(MEMORY_CMD),
-        "strengthen",
-        "--db",
-        str(MEMORY_DB),
-        ids_str,
-    ]
+            match_idx = match_indices[0]
 
-    print(
-        f"[memory_strengthen] Running: adaptive-memory strengthen {ids_str}", flush=True
-    )
+            # Perform replacement
+            to_lines = to_text.strip("\n").split("\n") if to_text.strip("\n") else []
+            new_window_lines = (
+                window_lines[:match_idx]
+                + to_lines
+                + window_lines[match_idx + len(from_lines) :]
+            )
+            new_lines = lines[:window_start] + new_window_lines
+            new_content = "\n".join(new_lines)
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+            STREAM_FILE.write_text(new_content)
 
-        print(
-            f"[memory_strengthen] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
-            flush=True,
-        )
+            # Calculate context window: 5 lines before and after the change
+            total_after = len(new_lines)
+            change_start_line = window_start + match_idx + 1  # 1-indexed
+            lines_in_replacement = len(to_lines) if to_lines else 0
 
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip()
-            print(f"[memory_strengthen] ERROR: {err_msg}", flush=True)
-            return f"Memory strengthen error: {err_msg}"
+            # Context: 5 before, the change, 5 after
+            context_start = max(1, change_start_line - 5)
+            context_end = min(
+                total_after, change_start_line + max(lines_in_replacement - 1, 0) + 5
+            )
 
-        return stdout.decode().strip()
+            context_lines = new_lines[context_start - 1 : context_end]
 
-    except FileNotFoundError:
-        print(
-            "[memory_strengthen] ERROR: adaptive-memory command not found", flush=True
-        )
-        return "Error: adaptive-memory command not found"
-    except Exception as e:
-        print(f"[memory_strengthen] ERROR: {type(e).__name__}: {e}", flush=True)
-        return f"Memory strengthen error: {e}"
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+    return f"Replaced. " + _format_lines(context_lines, context_start, total_after)
 
 
-async def tool_memory_tail() -> str:
-    """Get the 15 most recent memories."""
-    cmd = [
-        str(MEMORY_CMD),
-        "tail",
-        "--db",
-        str(MEMORY_DB),
-        "15",
-    ]
+def tool_stream_timeline() -> str:
+    """Get line ranges for each date header (# YYYY-MM-DD) in stream.txt."""
+    lines = _read_stream_lines()
+    total = len(lines)
 
-    print(f"[memory_tail] Running: adaptive-memory tail 15", flush=True)
+    if total == 0:
+        return "(empty file)"
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+    # Find all date headers and their line numbers
+    date_pattern = re.compile(r"^# (\d{4}-\d{2}-\d{2})")
+    dates = []  # [(line_num, date_str), ...]
 
-        print(
-            f"[memory_tail] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
-            flush=True,
-        )
+    for i, line in enumerate(lines):
+        match = date_pattern.match(line)
+        if match:
+            dates.append((i + 1, match.group(1)))  # 1-indexed
 
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip()
-            print(f"[memory_tail] ERROR: {err_msg}", flush=True)
-            return f"Memory tail error: {err_msg}"
+    if not dates:
+        return f"No date headers found (total: {total} lines)"
 
-        return stdout.decode().strip()
+    # Build output with line ranges
+    output = []
+    for i, (line_num, date_str) in enumerate(dates):
+        if i + 1 < len(dates):
+            end_line = dates[i + 1][0] - 1
+        else:
+            end_line = total
+        output.append(f"# {date_str}: lines {line_num}-{end_line}")
 
-    except FileNotFoundError:
-        print("[memory_tail] ERROR: adaptive-memory command not found", flush=True)
-        return "Error: adaptive-memory command not found"
-    except Exception as e:
-        print(f"[memory_tail] ERROR: {type(e).__name__}: {e}", flush=True)
-        return f"Memory tail error: {e}"
+    return "\n".join(output)
 
 
-async def tool_memory_list(
-    from_id: int | None = None, to_id: int | None = None, limit: int = 50
-) -> str:
-    """List memories by ID range."""
-    cmd = [
-        str(MEMORY_CMD),
-        "list",
-        "--db",
-        str(MEMORY_DB),
-        "--limit",
-        str(limit),
-    ]
-    if from_id is not None:
-        cmd.extend(["--from", str(from_id)])
-    if to_id is not None:
-        cmd.extend(["--to", str(to_id)])
+async def tool_ask_stream(query: str) -> str:
+    """Ask a question about the entire stream.txt file using long-context model."""
+    lines = _read_stream_lines()
+    total = len(lines)
 
-    print(f"[memory_list] Running: {' '.join(cmd)}", flush=True)
+    if total == 0:
+        return "Stream is empty."
+
+    content = "\n".join(lines)
+
+    prompt = f"""Answer this question based on the stream file content. Be concise and cite specific entries when relevant. If the information is not in the file, say so.
+
+Stream content ({total} lines):
+{content}
+
+Question: {query}"""
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        response = await long_context_complete(
+            messages=[{"role": "user", "content": prompt}],
         )
-        stdout, stderr = await proc.communicate()
-
-        print(
-            f"[memory_list] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
-            flush=True,
-        )
-
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip()
-            print(f"[memory_list] ERROR: {err_msg}", flush=True)
-            return f"Memory list error: {err_msg}"
-
-        return stdout.decode().strip()
-
-    except FileNotFoundError:
-        print("[memory_list] ERROR: adaptive-memory command not found", flush=True)
-        return "Error: adaptive-memory command not found"
+        return response.choices[0].message.content.strip()
+    except asyncio.TimeoutError:
+        return "Ask stream timed out"
     except Exception as e:
-        print(f"[memory_list] ERROR: {type(e).__name__}: {e}", flush=True)
-        return f"Memory list error: {e}"
-
-
-async def tool_memory_related(
-    ids: list[int],
-    limit: int = 10,
-    from_id: int | None = None,
-    to_id: int | None = None,
-) -> str:
-    """Find memories related to seed IDs via graph traversal."""
-    if not ids:
-        return "Error: No seed IDs provided"
-
-    ids_str = ",".join(str(i) for i in ids)
-    cmd = [
-        str(MEMORY_CMD),
-        "related",
-        "--db",
-        str(MEMORY_DB),
-        "--limit",
-        str(limit),
-        "--context",
-        str(MEMORY_CONTEXT),
-    ]
-    if from_id is not None:
-        cmd.extend(["--from", str(from_id)])
-    if to_id is not None:
-        cmd.extend(["--to", str(to_id)])
-    cmd.append(ids_str)
-
-    print(f"[memory_related] Running: {' '.join(cmd)}", flush=True)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-
-        print(
-            f"[memory_related] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
-            flush=True,
-        )
-
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip()
-            print(f"[memory_related] ERROR: {err_msg}", flush=True)
-            return f"Memory related error: {err_msg}"
-
-        return stdout.decode().strip()
-
-    except FileNotFoundError:
-        print("[memory_related] ERROR: adaptive-memory command not found", flush=True)
-        return "Error: adaptive-memory command not found"
-    except Exception as e:
-        print(f"[memory_related] ERROR: {type(e).__name__}: {e}", flush=True)
-        return f"Memory related error: {e}"
+        return f"Ask stream error: {e}"
 
 
 async def tool_web_search(query: str) -> str:
@@ -1088,32 +995,11 @@ async def tool_send_attachment(
 
 async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     """Execute a tool and return result."""
-    # Async tools - memory
-    if name == "memory_search":
-        return await tool_memory_search(
-            args["query"], args.get("from_id"), args.get("to_id")
-        )
-    if name == "memory_add":
-        return await tool_memory_add(args["text"], args["source"])
-    if name == "memory_strengthen":
-        return await tool_memory_strengthen(args["ids"])
-    if name == "memory_tail":
-        return await tool_memory_tail()
-    if name == "memory_list":
-        return await tool_memory_list(
-            args.get("from_id"), args.get("to_id"), args.get("limit", 50)
-        )
-    if name == "memory_related":
-        return await tool_memory_related(
-            args["ids"],
-            args.get("limit", 10),
-            args.get("from_id"),
-            args.get("to_id"),
-        )
-
-    # Async tools - other
+    # Async tools
     if name == "web_search":
         return await tool_web_search(args["query"])
+    if name == "ask_stream":
+        return await tool_ask_stream(args["query"])
     if name == "ask_attachment":
         return await tool_ask_attachment(args["attachment_id"], args["question"])
     if name == "send_attachment":
@@ -1123,6 +1009,17 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
 
     # Sync tools - dispatch table
     dispatch = {
+        "stream_tail": (tool_stream_tail, lambda a, c: (a.get("n", 50),)),
+        "stream_range": (
+            tool_stream_range,
+            lambda a, c: (a["from_line"], a["to_line"]),
+        ),
+        "stream_append": (tool_stream_append, lambda a, c: (a["text"],)),
+        "stream_replace": (
+            tool_stream_replace,
+            lambda a, c: (a["from_text"], a["to_text"]),
+        ),
+        "stream_timeline": (tool_stream_timeline, lambda a, c: ()),
         "random_pick": (tool_random_pick, lambda a, c: (a["items"], a.get("n", 1))),
         "schedule_wakeup": (
             tool_schedule_wakeup,
@@ -1490,40 +1387,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return None
 
         # Format message based on type
+        # Note: attachment_id is the ONLY way to retrieve the file later - filename is not stored
+        notice = f"(Save ID '{attachment_id}' to memory to retrieve this file in future sessions)"
         if attachment_type == "voice":
-            return f'[Voice {attachment_id}: "{description}"]'
+            return f'[Voice {attachment_id}: "{description}"]\n{notice}'
         elif attachment_type == "audio":
             fname = f" {original_filename}" if original_filename else ""
-            return f'[Audio {attachment_id}{fname}: "{description}"]'
+            return f'[Audio {attachment_id}{fname}: "{description}"]\n{notice}'
         elif attachment_type == "image":
             fname = f" {original_filename}" if original_filename else ""
-            return f"[Image {attachment_id}{fname}: {description}]"
+            return f"[Image {attachment_id}{fname}: {description}]\n{notice}"
         elif attachment_type == "pdf":
             fname = f" {original_filename}" if original_filename else ""
-            return f"[PDF {attachment_id}{fname}: {description}]"
+            return f"[PDF {attachment_id}{fname}: {description}]\n{notice}"
         else:
-            return f"[Attachment {attachment_id}: {description}]"
+            return f"[Attachment {attachment_id}: {description}]\n{notice}"
 
     # Handle voice messages
     if msg.voice:
-        result = await process_attachment(
-            msg.voice.file_id, ".ogg", "voice", preprocess_audio
-        )
-        if result:
-            text = f"{result}\n\n{text}".strip()
-        else:
-            text = f"[Voice message received but couldn't transcribe]\n\n{text}".strip()
+        try:
+            result = await process_attachment(
+                msg.voice.file_id, ".ogg", "voice", preprocess_audio
+            )
+            if result:
+                text = f"{result}\n\n{text}".strip()
+            else:
+                text = f"[Voice message received but couldn't transcribe]\n\n{text}".strip()
+        except Exception as e:
+            print(f"[handle_message] Voice download/process failed: {e}", flush=True)
+            text = f"[Voice message received but download failed]\n\n{text}".strip()
 
     # Handle photos (sent as photos, not documents)
     if msg.photo:
-        photo = msg.photo[-1]  # Highest resolution
-        result = await process_attachment(
-            photo.file_id, ".jpg", "image", preprocess_image
-        )
-        if result:
-            text = f"{result}\n\n{text}".strip()
-        else:
-            text = f"[Image received but couldn't process]\n\n{text}".strip()
+        try:
+            photo = msg.photo[-1]  # Highest resolution
+            result = await process_attachment(
+                photo.file_id, ".jpg", "image", preprocess_image
+            )
+            if result:
+                text = f"{result}\n\n{text}".strip()
+            else:
+                text = f"[Image received but couldn't process]\n\n{text}".strip()
+        except Exception as e:
+            print(f"[handle_message] Photo download/process failed: {e}", flush=True)
+            text = f"[Image received but download failed]\n\n{text}".strip()
 
     # Handle documents (images, PDFs, audio files)
     if msg.document:
@@ -1535,23 +1442,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if mime.startswith("image/"):
             # Image sent as document
             ext = ext or ".jpg"
-            result = await process_attachment(
-                doc.file_id, ext, "image", preprocess_image, original_filename
-            )
-            if result:
-                text = f"{result}\n\n{text}".strip()
-            else:
-                text = f"[Image received but couldn't process]\n\n{text}".strip()
+            try:
+                result = await process_attachment(
+                    doc.file_id, ext, "image", preprocess_image, original_filename
+                )
+                if result:
+                    text = f"{result}\n\n{text}".strip()
+                else:
+                    text = f"[Image received but couldn't process]\n\n{text}".strip()
+            except Exception as e:
+                print(
+                    f"[handle_message] Image doc download/process failed: {e}",
+                    flush=True,
+                )
+                text = f"[Image received but download failed: {original_filename}]\n\n{text}".strip()
 
         elif mime == "application/pdf" or ext == ".pdf":
             # PDF document
-            result = await process_attachment(
-                doc.file_id, ".pdf", "pdf", preprocess_pdf, original_filename
-            )
-            if result:
-                text = f"{result}\n\n{text}".strip()
-            else:
-                text = f"[PDF received but couldn't process: {original_filename}]\n\n{text}".strip()
+            try:
+                result = await process_attachment(
+                    doc.file_id, ".pdf", "pdf", preprocess_pdf, original_filename
+                )
+                if result:
+                    text = f"{result}\n\n{text}".strip()
+                else:
+                    text = f"[PDF received but couldn't process: {original_filename}]\n\n{text}".strip()
+            except Exception as e:
+                print(f"[handle_message] PDF download/process failed: {e}", flush=True)
+                text = f"[PDF received but download failed: {original_filename}]\n\n{text}".strip()
 
         elif mime.startswith("audio/") or ext in (
             ".mp3",
@@ -1563,13 +1481,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ):
             # Audio file
             ext = ext or ".mp3"
-            result = await process_attachment(
-                doc.file_id, ext, "audio", preprocess_audio, original_filename
-            )
-            if result:
-                text = f"{result}\n\n{text}".strip()
-            else:
-                text = f"[Audio received but couldn't transcribe: {original_filename}]\n\n{text}".strip()
+            try:
+                result = await process_attachment(
+                    doc.file_id, ext, "audio", preprocess_audio, original_filename
+                )
+                if result:
+                    text = f"{result}\n\n{text}".strip()
+                else:
+                    text = f"[Audio received but couldn't transcribe: {original_filename}]\n\n{text}".strip()
+            except Exception as e:
+                print(
+                    f"[handle_message] Audio download/process failed: {e}", flush=True
+                )
+                text = f"[Audio received but download failed: {original_filename}]\n\n{text}".strip()
 
         else:
             # Unsupported document type
