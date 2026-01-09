@@ -193,6 +193,18 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "session_brief",
+            "description": "Get a comprehensive session brief including: tail 50 lines, timeline, and AI-generated summary of urgent items, calendar events, active todos, upcoming events, and retrieval aids. Use at start of sessions or when user asks for a briefing.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "Search the web for current information. Use for weather, news, facts, recommendations, prices, etc.",
             "parameters": {
@@ -703,6 +715,49 @@ Question: {query}"""
         return f"Ask stream error: {e}"
 
 
+async def tool_session_brief() -> str:
+    """Get session brief: tail 50 lines + AI-generated summary."""
+    lines = _read_stream_lines()
+    total = len(lines)
+
+    if total == 0:
+        return "Stream is empty."
+
+    # Get tail 50 lines
+    tail_lines = lines[-50:] if total > 50 else lines
+    tail_start = max(1, total - 49)
+    tail_output = "\n".join(
+        f"{tail_start + i}: {line}" for i, line in enumerate(tail_lines)
+    )
+
+    # Generate detailed brief from full stream
+    content = "\n".join(lines)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    prompt = f"""Today is {today}. Give me a thorough session brief:
+1. URGENT - items due today or overdue
+2. CALENDAR - all events for today AND tomorrow (include recurring schedules like weekly classes)
+3. ACTIVE TODOS - open items being worked on
+4. UPCOMING - next 7 days of scheduled events
+5. RETRIEVAL AIDS - keywords/names/pointers useful for later searches
+Do not skip recurring events. Be thorough, not concise.
+
+Stream content ({total} lines):
+{content}"""
+
+    try:
+        response = await long_context_complete(
+            messages=[{"role": "user", "content": prompt}],
+        )
+        brief = response.choices[0].message.content.strip()
+    except asyncio.TimeoutError:
+        brief = "Brief generation timed out"
+    except Exception as e:
+        brief = f"Brief generation error: {e}"
+
+    return f"=== TAIL 50 LINES ===\n{tail_output}\n\n=== SESSION BRIEF ===\n{brief}"
+
+
 async def tool_web_search(query: str) -> str:
     """Web search using Grok online via OpenRouter."""
     try:
@@ -1007,6 +1062,8 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_web_search(args["query"])
     if name == "ask_stream":
         return await tool_ask_stream(args["query"])
+    if name == "session_brief":
+        return await tool_session_brief()
     if name == "ask_attachment":
         return await tool_ask_attachment(args["attachment_id"], args["question"])
     if name == "send_attachment":

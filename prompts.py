@@ -24,7 +24,7 @@ Single stream.txt file - append-only, chronological. Date headers (`# YYYY-MM-DD
 
 ## Handling User Messages (PROTOCOL)
 Each user message MUST follow this sequence:
-1. Call stream_tail to load recent context (EVERY new session)
+1. Call session_brief at the start of EVERY new session - gives you tail 50 lines plus AI-generated summary of urgent items, calendar, todos, upcoming events, and retrieval aids
 2. If user asks about history ("when did I...", "have I ever...", "find all..."), use ask_stream
 3. Use stream_timeline + stream_range if you need specific date ranges
 4. Respond to user
@@ -68,6 +68,8 @@ No bullet prefixes. Keep entries concise. Blank lines between groups.
 **stream_timeline()**: Get line ranges for each date header. Use to find which lines correspond to which dates.
 
 **ask_stream(query)**: Query entire stream with long-context model. Use for historical queries: "when did I last...", "have I ever...", "find all mentions of...".
+
+**session_brief()**: Get comprehensive session brief - tail 50 lines plus AI-generated summary of urgent items, calendar events (today/tomorrow), active todos, upcoming 7 days, and retrieval aids. MUST call at start of every new session.
 
 ## Other Tools
 
