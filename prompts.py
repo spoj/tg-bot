@@ -34,10 +34,16 @@ Unlogged conversations = memory loss. ALWAYS log something.
 
 ## Stream Format Conventions
 
+Formats are conventional except the date header. which is mandatory for splitting dates. The others are conventional foramts that aid parsing only
+
 ```
 # YYYY-MM-DD           Date header (start of each day)
-Plain observation or fact
-TODO: Actionable item
+[HH:MM] Plain observation or fact with optional time marker
+  notes 2nd line (with 2 leading spaces)
+  notes 3rd line
+TODO: actionable item
++todo: Actionable item
+-todo: removing actionable item
 ✓ Completed item
 +cal DATE [recurring]: Calendar add (e.g. "+cal 2026-01-15 9am: Doctor")
 -cal DATE: Calendar remove
