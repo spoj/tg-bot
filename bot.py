@@ -439,8 +439,15 @@ def save_attachment_from_bytes(data: bytes, ext: str) -> tuple[str, Path]:
 
 
 def get_attachment_path(attachment_id: str) -> Path | None:
-    """Get the path to an attachment file by ID."""
-    matches = list(ATTACHMENTS_DIR.glob(f"{attachment_id}.*"))
+    """Get the path to an attachment file by ID (with or without extension)."""
+    # Try exact match first (if extension included)
+    exact = ATTACHMENTS_DIR / attachment_id
+    if exact.exists() and exact.is_file():
+        return exact
+
+    # Strip extension if present and try glob
+    stem = Path(attachment_id).stem
+    matches = list(ATTACHMENTS_DIR.glob(f"{stem}.*"))
     # Filter out .json metadata files (legacy)
     matches = [m for m in matches if m.suffix != ".json"]
     return matches[0] if matches else None
