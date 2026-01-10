@@ -22,7 +22,7 @@ SEARCH = {
 }
 
 LONG_CONTEXT = {
-    "model": "gemini/gemini-3-pro-preview",
+    "model": "gemini/gemini-3-flash-preview",
     "max_tokens": 8000,
     "timeout": 300,
 }
