@@ -67,7 +67,7 @@ SESSION_TIMEOUT = 60 * 60  # 1 hour
 MAX_TOOL_ITERATIONS = 50
 
 # Memory config
-MEMORY_DB = DATA_DIR / "adaptive_memory.db"
+MEMORY_DB = DATA_DIR / "mem.db"
 MEMORY_CONTEXT = 0
 MEMORY_CMD = Path.home() / ".cargo" / "bin" / "adaptive-memory"
 
@@ -84,13 +84,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memory_search",
-            "description": "Search associative memory. Returns memories with IDs, text, and relevance scores. MUST call at least once per user message to get relevant background.",
+            "description": "Search associative memory. Returns memories with IDs, text, and relevance scores. MUST call at least once per user message to get relevant background. Returns up to 10 results by default.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "Search query for memories",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default 10)",
                     },
                     "from_id": {
                         "type": "integer",
@@ -130,15 +134,15 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "memory_strengthen",
-            "description": "Strengthen associations between memories. Call with IDs of memories relevant to the current query after searching.",
+            "name": "memory_link",
+            "description": "Link memories together. Call with IDs of memories relevant to the current query after searching.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "ids": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "Memory IDs to strengthen relationships between (max 10)",
+                        "description": "Memory IDs to link together (max 10)",
                     }
                 },
                 "required": ["ids"],
@@ -149,7 +153,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memory_tail",
-            "description": "Get the most recent memories. Use to see recent context without searching.",
+            "description": "Get the 20 most recent memories. Use to see recent context without searching.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -161,7 +165,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memory_list",
-            "description": "List memories by ID range. Use to retrieve specific memories by their IDs.",
+            "description": "List memories by ID range. Use to retrieve specific memories by their IDs. Returns up to 20 results by default.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -175,7 +179,7 @@ TOOLS = [
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of results (default 50)",
+                        "description": "Maximum number of results (default 20)",
                     },
                 },
                 "required": [],
@@ -186,7 +190,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memory_related",
-            "description": "Find memories related to seed IDs via graph traversal (Personalized PageRank). Use after memory_search to explore connections from specific memory IDs. Skips text search - purely graph-based.",
+            "description": "Find memories related to seed IDs via graph traversal (Personalized PageRank). Use after memory_search to explore connections from specific memory IDs. Skips text search - purely graph-based. Returns up to 10 results by default.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -491,20 +495,10 @@ def get_mime_type(file_path: Path) -> str:
 # --- Tool implementations ---
 
 
-def log_access(query: str, source: str = "tg") -> None:
-    """Append query to ACCESS.log for analysis."""
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    access_log = DATA_DIR / "ACCESS.log"
-    line = f'{timestamp} {source} "{query}"\n'
-    with open(access_log, "a") as f:
-        f.write(line)
-
-
 async def tool_memory_search(
-    query: str, from_id: int | None = None, to_id: int | None = None
+    query: str, limit: int = 10, from_id: int | None = None, to_id: int | None = None
 ) -> str:
-    """Search adaptive memory."""
-    log_access(query, "tg")
+    """Search adaptive memory. Returns up to `limit` results (default 10)."""
 
     cmd = [
         str(MEMORY_CMD),
@@ -513,6 +507,8 @@ async def tool_memory_search(
         str(MEMORY_DB),
         "--context",
         str(MEMORY_CONTEXT),
+        "--limit",
+        str(limit),
     ]
     if from_id is not None:
         cmd.extend(["--from", str(from_id)])
@@ -599,28 +595,26 @@ async def tool_memory_add(text: str, source: str) -> str:
         return f"Memory add error: {e}"
 
 
-async def tool_memory_strengthen(ids: list[int]) -> str:
-    """Strengthen relationships between memory IDs."""
+async def tool_memory_link(ids: list[int]) -> str:
+    """Link memories together."""
     if not ids:
-        print("[memory_strengthen] ERROR: No IDs provided", flush=True)
+        print("[memory_link] ERROR: No IDs provided", flush=True)
         return "Error: No IDs provided"
 
     if len(ids) > 10:
-        print(f"[memory_strengthen] ERROR: Too many IDs ({len(ids)} > 10)", flush=True)
+        print(f"[memory_link] ERROR: Too many IDs ({len(ids)} > 10)", flush=True)
         return "Error: Maximum 10 IDs allowed"
 
     ids_str = ",".join(str(i) for i in ids)
     cmd = [
         str(MEMORY_CMD),
-        "strengthen",
+        "link",
         "--db",
         str(MEMORY_DB),
         ids_str,
     ]
 
-    print(
-        f"[memory_strengthen] Running: adaptive-memory strengthen {ids_str}", flush=True
-    )
+    print(f"[memory_link] Running: adaptive-memory link {ids_str}", flush=True)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -631,38 +625,36 @@ async def tool_memory_strengthen(ids: list[int]) -> str:
         stdout, stderr = await proc.communicate()
 
         print(
-            f"[memory_strengthen] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
+            f"[memory_link] returncode={proc.returncode}, stdout={len(stdout)}b, stderr={len(stderr)}b",
             flush=True,
         )
 
         if proc.returncode != 0:
             err_msg = stderr.decode().strip()
-            print(f"[memory_strengthen] ERROR: {err_msg}", flush=True)
-            return f"Memory strengthen error: {err_msg}"
+            print(f"[memory_link] ERROR: {err_msg}", flush=True)
+            return f"Memory link error: {err_msg}"
 
         return stdout.decode().strip()
 
     except FileNotFoundError:
-        print(
-            "[memory_strengthen] ERROR: adaptive-memory command not found", flush=True
-        )
+        print("[memory_link] ERROR: adaptive-memory command not found", flush=True)
         return "Error: adaptive-memory command not found"
     except Exception as e:
-        print(f"[memory_strengthen] ERROR: {type(e).__name__}: {e}", flush=True)
-        return f"Memory strengthen error: {e}"
+        print(f"[memory_link] ERROR: {type(e).__name__}: {e}", flush=True)
+        return f"Memory link error: {e}"
 
 
 async def tool_memory_tail() -> str:
-    """Get the 15 most recent memories."""
+    """Get the 20 most recent memories."""
     cmd = [
         str(MEMORY_CMD),
         "tail",
         "--db",
         str(MEMORY_DB),
-        "15",
+        "20",
     ]
 
-    print(f"[memory_tail] Running: adaptive-memory tail 15", flush=True)
+    print(f"[memory_tail] Running: adaptive-memory tail 20", flush=True)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -693,9 +685,9 @@ async def tool_memory_tail() -> str:
 
 
 async def tool_memory_list(
-    from_id: int | None = None, to_id: int | None = None, limit: int = 50
+    from_id: int | None = None, to_id: int | None = None, limit: int = 20
 ) -> str:
-    """List memories by ID range."""
+    """List memories by ID range. Returns up to `limit` results (default 20)."""
     cmd = [
         str(MEMORY_CMD),
         "list",
@@ -1098,17 +1090,17 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     # Async tools - memory
     if name == "memory_search":
         return await tool_memory_search(
-            args["query"], args.get("from_id"), args.get("to_id")
+            args["query"], args.get("limit", 10), args.get("from_id"), args.get("to_id")
         )
     if name == "memory_add":
         return await tool_memory_add(args["text"], args["source"])
-    if name == "memory_strengthen":
-        return await tool_memory_strengthen(args["ids"])
+    if name == "memory_link":
+        return await tool_memory_link(args["ids"])
     if name == "memory_tail":
         return await tool_memory_tail()
     if name == "memory_list":
         return await tool_memory_list(
-            args.get("from_id"), args.get("to_id"), args.get("limit", 50)
+            args.get("from_id"), args.get("to_id"), args.get("limit", 20)
         )
     if name == "memory_related":
         return await tool_memory_related(
