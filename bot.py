@@ -715,47 +715,93 @@ Question: {query}"""
         return f"Ask stream error: {e}"
 
 
-async def tool_session_brief() -> str:
-    """Get session brief: tail 50 lines + AI-generated summary."""
+def _find_latest_snapshot() -> Path | None:
+    """Find the most recent snapshot-YYYY-MM-DD-HH-MM.txt file."""
+    pattern = re.compile(r"^snapshot-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2})\.txt$")
+    snapshots = []
+
+    for f in DATA_DIR.iterdir():
+        match = pattern.match(f.name)
+        if match:
+            snapshots.append((match.group(1), f))
+
+    if not snapshots:
+        return None
+
+    # Sort by timestamp string (lexicographic works for this format)
+    snapshots.sort(key=lambda x: x[0], reverse=True)
+    return snapshots[0][1]
+
+
+def _get_date_from_snapshot_filename(path: Path) -> str | None:
+    """Extract date (YYYY-MM-DD) from snapshot-YYYY-MM-DD-HH-MM.txt filename."""
+    match = re.search(r"snapshot-(\d{4}-\d{2}-\d{2})-\d{2}-\d{2}\.txt$", path.name)
+    return match.group(1) if match else None
+
+
+def _extract_stream_from_date(lines: list[str], from_date: str) -> list[str]:
+    """Extract stream entries from given date onwards (inclusive)."""
+    result = []
+    include = False
+
+    for line in lines:
+        # Check for date header
+        date_match = re.match(r"^# (\d{4}-\d{2}-\d{2})$", line)
+        if date_match:
+            line_date = date_match.group(1)
+            include = line_date >= from_date
+
+        if include:
+            result.append(line)
+
+    return result
+
+
+def tool_session_brief() -> str:
+    """Get session brief: snapshot + recent stream entries (deterministic, no AI synthesis)."""
     lines = _read_stream_lines()
     total = len(lines)
 
     if total == 0:
         return "Stream is empty."
 
-    # Get tail 50 lines
-    tail_lines = lines[-50:] if total > 50 else lines
-    tail_start = max(1, total - 49)
-    tail_output = "\n".join(
-        f"{tail_start + i}: {line}" for i, line in enumerate(tail_lines)
-    )
+    # Check for snapshot
+    snapshot_path = _find_latest_snapshot()
+    snapshot_date: str | None = None
 
-    # Generate detailed brief from full stream
-    content = "\n".join(lines)
-    today = datetime.now().strftime("%Y-%m-%d")
+    if snapshot_path:
+        snapshot_date = _get_date_from_snapshot_filename(snapshot_path)
 
-    prompt = f"""Today is {today}. Give me a thorough session brief:
-1. URGENT - items due today or overdue
-2. CALENDAR - all events for today AND tomorrow (include recurring schedules like weekly classes)
-3. ACTIVE TODOS - open items being worked on
-4. UPCOMING - next 7 days of scheduled events
-5. RETRIEVAL AIDS - keywords/names/pointers useful for later searches
-Do not skip recurring events. Be thorough, not concise.
+    if snapshot_path and snapshot_date:
+        # Snapshot exists: return snapshot + stream delta
+        snapshot_content = snapshot_path.read_text()
 
-Stream content ({total} lines):
-{content}"""
+        # Get stream entries from snapshot date onwards
+        delta_lines = _extract_stream_from_date(lines, snapshot_date)
 
-    try:
-        response = await long_context_complete(
-            messages=[{"role": "user", "content": prompt}],
+        # If delta is less than 50 lines, use last 50 lines instead
+        if len(delta_lines) < 50:
+            stream_lines = lines[-50:] if total > 50 else lines
+            stream_start = max(1, total - 49)
+        else:
+            stream_lines = delta_lines
+            stream_start = total - len(delta_lines) + 1
+
+        stream_output = "\n".join(
+            f"{stream_start + i}: {line}" for i, line in enumerate(stream_lines)
         )
-        brief = response.choices[0].message.content.strip()
-    except asyncio.TimeoutError:
-        brief = "Brief generation timed out"
-    except Exception as e:
-        brief = f"Brief generation error: {e}"
 
-    return f"=== TAIL 50 LINES ===\n{tail_output}\n\n=== SESSION BRIEF ===\n{brief}"
+        return f"""=== SNAPSHOT ({snapshot_path.name}) ===
+{snapshot_content}
+
+=== STREAM SINCE {snapshot_date} ({len(stream_lines)} lines) ===
+{stream_output}"""
+    else:
+        # No snapshot: return full stream
+        stream_output = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+
+        return f"""=== NO SNAPSHOT - FULL STREAM ({total} lines) ===
+{stream_output}"""
 
 
 async def tool_web_search(query: str) -> str:
@@ -1063,7 +1109,7 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     if name == "ask_stream":
         return await tool_ask_stream(args["query"])
     if name == "session_brief":
-        return await tool_session_brief()
+        return tool_session_brief()
     if name == "ask_attachment":
         return await tool_ask_attachment(args["attachment_id"], args["question"])
     if name == "send_attachment":
