@@ -1278,17 +1278,23 @@ async def run_agent(
     user_name = USER_NAMES.get(user_id, "Unknown") if user_id else "Unknown"
     user_message = f"[{current_time}] [{user_name}] {user_message}"
 
-    # Build messages for API with cache control on the last user message
+    # Build messages for API with cache control on user message
     # This enables Anthropic prompt caching via OpenRouter (90% cost reduction on cache hits)
-    # Cache breakpoint on last user message = cache system + history + user message
-    # Tool loop iterations 2+ will hit cache, only paying for new tool results
+    # Cache breakpoint on user message = cache system + history + user message
+    # Tool loop iterations 2+ hit cache, only paying for new assistant/tool messages
+    # NOTE: Must use content block format (array with cache_control inside) for OpenRouter
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     messages.append(
         {
             "role": "user",
-            "content": user_message,
-            "cache_control": {"type": "ephemeral"},
+            "content": [
+                {
+                    "type": "text",
+                    "text": user_message,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
         }
     )
 
@@ -1334,14 +1340,20 @@ async def run_agent(
             return f"API error: {e}"
 
         # Log cache stats from response usage
+        # LiteLLM puts cache info in usage.prompt_tokens_details
         usage = getattr(response, "usage", None)
         if usage:
-            cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
             input_tokens = getattr(usage, "prompt_tokens", 0) or 0
             output_tokens = getattr(usage, "completion_tokens", 0) or 0
+            # Extract cache stats from prompt_tokens_details (LiteLLM format)
+            details = getattr(usage, "prompt_tokens_details", None)
+            cache_read = 0
+            cache_write = 0
+            if details:
+                cache_read = getattr(details, "cached_tokens", 0) or 0
+                cache_write = getattr(details, "cache_write_tokens", 0) or 0
             print(
-                f"[run_agent] tokens: in={input_tokens} out={output_tokens} cache_write={cache_create} cache_read={cache_read}",
+                f"[run_agent] tokens: in={input_tokens} out={output_tokens} cache_write={cache_write} cache_read={cache_read}",
                 flush=True,
             )
 
@@ -1400,6 +1412,19 @@ async def run_agent(
             return {"role": "tool", "tool_call_id": tc.id, "content": result}
 
         tool_results = await asyncio.gather(*[run_tool(tc) for tc in msg.tool_calls])
+
+        # Add cache_control to the last tool result for Opus 4.5 caching
+        # (requires >4k tokens, tool results often push us over threshold)
+        if tool_results:
+            last_result = tool_results[-1]
+            last_result["content"] = [
+                {
+                    "type": "text",
+                    "text": last_result["content"],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
         messages.extend(tool_results)
 
         # Check for interrupt after all tools complete
