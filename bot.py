@@ -1285,6 +1285,9 @@ async def run_agent(
     # NOTE: Must use content block format (array with cache_control inside) for OpenRouter
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
+    # Track which message index has the cache_control (for moving it later)
+    # Initially cache the user message; will move to latest tool result each iteration
+    cache_control_idx = len(messages)  # Index of the message we're about to append
     messages.append(
         {
             "role": "user",
@@ -1413,9 +1416,15 @@ async def run_agent(
 
         tool_results = await asyncio.gather(*[run_tool(tc) for tc in msg.tool_calls])
 
-        # Add cache_control to the last tool result for Opus 4.5 caching
-        # (requires >4k tokens, tool results often push us over threshold)
+        # Move cache_control from previous location to last tool result
+        # Only one cache breakpoint allowed per API call
         if tool_results:
+            # Remove cache_control from previous cached message
+            prev_msg = messages[cache_control_idx]
+            if isinstance(prev_msg.get("content"), list) and prev_msg["content"]:
+                prev_msg["content"][0].pop("cache_control", None)
+
+            # Add cache_control to the last tool result
             last_result = tool_results[-1]
             last_result["content"] = [
                 {
@@ -1425,7 +1434,11 @@ async def run_agent(
                 }
             ]
 
-        messages.extend(tool_results)
+            messages.extend(tool_results)
+            # Update cache_control_idx to point to the new cached message
+            cache_control_idx = len(messages) - 1
+        else:
+            messages.extend(tool_results)
 
         # Check for interrupt after all tools complete
         if interrupt and interrupt.is_set():
