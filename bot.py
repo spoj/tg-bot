@@ -1284,7 +1284,21 @@ async def run_agent(
     # Tool loop iterations 2+ hit cache, only paying for new assistant/tool messages
     # NOTE: Must use content block format (array with cache_control inside) for OpenRouter
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
+
+    # Strip any stale cache_control from history (they persist from previous sessions)
+    # Anthropic allows max 4 cache_control blocks per request
+    def strip_cache_control(msg: dict) -> dict:
+        """Return a copy of the message with cache_control removed from content blocks."""
+        if not isinstance(msg.get("content"), list):
+            return msg
+        new_content = []
+        for block in msg["content"]:
+            if isinstance(block, dict) and "cache_control" in block:
+                block = {k: v for k, v in block.items() if k != "cache_control"}
+            new_content.append(block)
+        return {**msg, "content": new_content}
+
+    messages.extend(strip_cache_control(m) for m in history)
     # Track which message index has the cache_control (for moving it later)
     # Initially cache the user message; will move to latest tool result each iteration
     cache_control_idx = len(messages)  # Index of the message we're about to append
