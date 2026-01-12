@@ -1729,18 +1729,23 @@ async def process_wakeup(wakeup: dict, bot) -> None:
         )
 
         # Send the response
-        chunks = (
-            [response[i : i + 4096] for i in range(0, len(response), 4096)]
-            if len(response) > 4096
-            else [response]
-        )
+        if response:
+            chunks = (
+                [response[i : i + 4096] for i in range(0, len(response), 4096)]
+                if len(response) > 4096
+                else [response]
+            )
 
-        for chunk in chunks:
-            try:
-                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
-            except TelegramError as e:
-                print(f"[scheduler] HTML parse failed: {e}", flush=True)
-                await bot.send_message(chat_id=chat_id, text=chunk)
+            for chunk in chunks:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id, text=chunk, parse_mode="HTML"
+                    )
+                except TelegramError as e:
+                    print(f"[scheduler] HTML parse failed: {e}", flush=True)
+                    await bot.send_message(chat_id=chat_id, text=chunk)
+        else:
+            print(f"[scheduler] Wakeup {wakeup_id} returned no response", flush=True)
 
         print(f"[scheduler] Completed wakeup {wakeup_id}", flush=True)
 
