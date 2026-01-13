@@ -857,7 +857,7 @@ def _extract_stream_from_date(lines: list[str], from_date: str) -> list[str]:
 
 
 def tool_session_brief() -> str:
-    """Get session brief: snapshot + recent stream entries (deterministic, no AI synthesis)."""
+    """Get session brief: snapshot + stream from snapshot date onwards."""
     lines = _read_stream_lines()
     total = len(lines)
 
@@ -872,28 +872,46 @@ def tool_session_brief() -> str:
         snapshot_date = _get_date_from_snapshot_filename(snapshot_path)
 
     if snapshot_path and snapshot_date:
-        # Snapshot exists: return snapshot + stream delta
+        # Snapshot exists: return snapshot + stream from snapshot date onwards
         snapshot_content = snapshot_path.read_text()
 
-        # Get stream entries from snapshot date onwards
-        delta_lines = _extract_stream_from_date(lines, snapshot_date)
+        # Get all date headers in the stream
+        date_pattern = re.compile(r"^# (\d{4}-\d{2}-\d{2})$")
+        dates_in_stream = []
+        for line in lines:
+            match = date_pattern.match(line)
+            if match:
+                dates_in_stream.append(match.group(1))
 
-        # If delta is less than 50 lines, use last 50 lines instead
-        if len(delta_lines) < 50:
-            stream_lines = lines[-50:] if total > 50 else lines
-            stream_start = max(1, total - 49)
-        else:
-            stream_lines = delta_lines
-            stream_start = total - len(delta_lines) + 1
+        # Start from snapshot date, expand backwards until we have ≥50 lines
+        from_date = snapshot_date
+        delta_lines = _extract_stream_from_date(lines, from_date)
 
-        stream_output = "\n".join(
-            f"{stream_start + i}: {line}" for i, line in enumerate(stream_lines)
+        # Find dates before snapshot_date to expand if needed
+        earlier_dates = sorted(
+            [d for d in dates_in_stream if d < snapshot_date], reverse=True
         )
+
+        while len(delta_lines) < 50 and earlier_dates:
+            from_date = earlier_dates.pop(0)
+            delta_lines = _extract_stream_from_date(lines, from_date)
+
+        if delta_lines:
+            stream_start = total - len(delta_lines) + 1
+            stream_output = "\n".join(
+                f"{stream_start + i}: {line}" for i, line in enumerate(delta_lines)
+            )
+            stream_header = (
+                f"=== STREAM FROM {from_date} ({len(delta_lines)} lines) ==="
+            )
+        else:
+            stream_output = "(no entries)"
+            stream_header = "=== STREAM ==="
 
         return f"""=== SNAPSHOT ({snapshot_path.name}) ===
 {snapshot_content}
 
-=== STREAM SINCE {snapshot_date} ({len(stream_lines)} lines) ===
+{stream_header}
 {stream_output}"""
     else:
         # No snapshot: return full stream
