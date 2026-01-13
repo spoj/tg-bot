@@ -541,6 +541,8 @@ def get_attachment_type(file_path: Path) -> str:
         return "image"
     elif ext in (".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac"):
         return "audio"
+    elif ext in (".mp4", ".webm", ".mov", ".avi", ".mkv"):
+        return "video"
     elif ext == ".pdf":
         return "pdf"
     return "unknown"
@@ -563,6 +565,12 @@ def get_mime_type(file_path: Path) -> str:
         ".m4a": "audio/mp4",
         ".aac": "audio/aac",
         ".flac": "audio/flac",
+        # Video
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mov": "video/quicktime",
+        ".avi": "video/x-msvideo",
+        ".mkv": "video/x-matroska",
         # PDF
         ".pdf": "application/pdf",
     }
@@ -1123,15 +1131,8 @@ async def tool_ask_attachment(attachment_id: str, question: str) -> str:
                     "image_url": {"url": f"data:{mime_type};base64,{b64}"},
                 },
             ]
-        elif attachment_type in ("voice", "audio"):
-            content = [
-                {"type": "text", "text": question},
-                {
-                    "type": "file",
-                    "file": {"file_data": f"data:{mime_type};base64,{b64}"},
-                },
-            ]
-        elif attachment_type == "pdf":
+        elif attachment_type in ("voice", "audio", "video", "pdf"):
+            # Audio, video, PDF all use file format
             content = [
                 {"type": "text", "text": question},
                 {
@@ -1140,7 +1141,14 @@ async def tool_ask_attachment(attachment_id: str, question: str) -> str:
                 },
             ]
         else:
-            return f"Error: Unsupported attachment type: {attachment_type}"
+            # Unknown type - try as file anyway, Gemini might handle it
+            content = [
+                {"type": "text", "text": question},
+                {
+                    "type": "file",
+                    "file": {"file_data": f"data:{mime_type};base64,{b64}"},
+                },
+            ]
 
         response = await vision_complete(
             messages=[{"role": "user", "content": content}],
@@ -1253,25 +1261,8 @@ async def tool_e2b_gemini(path: str, query: str, chat_id: int) -> str:
         if not content:
             return "Error: Empty file"
 
-        # Determine MIME type from extension
-        ext = Path(path).suffix.lower()
-        mime_map = {
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-            ".wav": "audio/wav",
-            ".mp3": "audio/mpeg",
-            ".ogg": "audio/ogg",
-            ".m4a": "audio/mp4",
-            ".aac": "audio/aac",
-            ".flac": "audio/flac",
-            ".mp4": "video/mp4",
-            ".webm": "video/webm",
-            ".pdf": "application/pdf",
-        }
-        mime_type = mime_map.get(ext, "application/octet-stream")
+        # Determine MIME type from extension (reuse get_mime_type)
+        mime_type = get_mime_type(Path(path))
 
         # Encode and send to Gemini
         b64 = base64.b64encode(content).decode()
@@ -1283,7 +1274,7 @@ async def tool_e2b_gemini(path: str, query: str, chat_id: int) -> str:
                 "image_url": {"url": f"data:{mime_type};base64,{b64}"},
             }
         else:
-            # Audio, video, PDF, etc.
+            # Audio, video, PDF, and anything else - try as file
             file_content = {
                 "type": "file",
                 "file": {"file_data": f"data:{mime_type};base64,{b64}"},
@@ -1899,10 +1890,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 text = f"[Audio received but download failed: {original_filename}]\n\n{text}".strip()
 
         else:
-            # Unsupported document type
-            text = (
-                f"[Document received: {original_filename} ({mime})]\n\n{text}".strip()
-            )
+            # Any other document type - save without preprocessing
+            # Model can use e2b_upload + e2b_run to inspect these
+            ext = ext or ".bin"
+            try:
+                file = await context.bot.get_file(doc.file_id)
+                data = bytes(await file.download_as_bytearray())
+                attachment_id, _ = save_attachment_from_bytes(data, ext)
+                notice = f"(Save ID '{attachment_id}' to memory. Use e2b_upload to inspect with code.)"
+                text = f"[File {attachment_id} {original_filename} ({mime}, {len(data)} bytes)]\n{notice}\n\n{text}".strip()
+            except Exception as e:
+                print(f"[handle_message] File download failed: {e}", flush=True)
+                text = f"[File received but download failed: {original_filename}]\n\n{text}".strip()
 
     if not text:
         return
