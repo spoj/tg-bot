@@ -35,6 +35,7 @@ from prompts import (
     SYSTEM_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
 )
+from e2b_sandbox import sandbox_manager
 from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -330,6 +331,96 @@ TOOLS = [
                     },
                 },
                 "required": ["attachment_id"],
+            },
+        },
+    },
+    # --- E2B Sandbox Tools ---
+    {
+        "type": "function",
+        "function": {
+            "name": "e2b_upload",
+            "description": "Upload an attachment to the E2B sandbox for processing. Use when you need to run code on a file (xlsx, video, etc). Returns the remote path in the sandbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": {
+                        "type": "string",
+                        "description": "The attachment ID to upload",
+                    },
+                },
+                "required": ["attachment_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "e2b_run",
+            "description": "Run a shell command in the E2B sandbox. Use for Python scripts, ffmpeg, etc. Returns stdout/stderr. Working dir: /home/user/workspace. Pre-installed: python, pip, ffmpeg, openpyxl, pandas, numpy.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute (e.g., 'python script.py', 'ffmpeg -i video.mp4 audio.wav')",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "e2b_read",
+            "description": "Read a text file from the E2B sandbox. Use to inspect code output, logs, or generated text files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to file (relative to workspace or absolute)",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "e2b_gemini",
+            "description": "Send a file from the E2B sandbox to Gemini for analysis. Use for audio transcription, image analysis, or any multimodal query on sandbox files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to file in sandbox (relative to workspace or absolute)",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Question or instruction for Gemini about the file",
+                    },
+                },
+                "required": ["path", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "e2b_download",
+            "description": "Download a file from the E2B sandbox and save as a local attachment. Returns the new attachment_id for use with send_attachment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to file in sandbox (relative to workspace or absolute)",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },
@@ -1101,6 +1192,145 @@ async def tool_send_attachment(
         return f"Error sending attachment: {e}"
 
 
+# --- E2B Sandbox tools ---
+
+
+async def tool_e2b_upload(attachment_id: str, chat_id: int) -> str:
+    """Upload an attachment to the E2B sandbox."""
+    # Find the attachment file
+    attachment_path = get_attachment_path(attachment_id)
+    if not attachment_path:
+        return f"Error: Attachment {attachment_id} not found"
+
+    try:
+        content = attachment_path.read_bytes()
+        filename = attachment_path.name
+        remote_path = await sandbox_manager.upload_file(chat_id, filename, content)
+        return f"Uploaded to sandbox: {remote_path} ({len(content)} bytes)"
+    except Exception as e:
+        print(f"[e2b_upload] Error: {e}", flush=True)
+        return f"Error uploading to sandbox: {e}"
+
+
+async def tool_e2b_run(command: str, chat_id: int) -> str:
+    """Run a command in the E2B sandbox."""
+    try:
+        result = await sandbox_manager.run_command(chat_id, command)
+        output = ""
+        if result["stdout"]:
+            output += result["stdout"]
+        if result["stderr"]:
+            if output:
+                output += "\n--- STDERR ---\n"
+            output += result["stderr"]
+        if not result["success"]:
+            output += f"\n[Exit code: {result['exit_code']}]"
+        return output.strip() or "(No output)"
+    except Exception as e:
+        print(f"[e2b_run] Error: {e}", flush=True)
+        return f"Error running command: {e}"
+
+
+async def tool_e2b_read(path: str, chat_id: int) -> str:
+    """Read a text file from the E2B sandbox."""
+    try:
+        content, error = await sandbox_manager.read_file(chat_id, path)
+        if error:
+            return f"Error: {error}"
+        return content or "(Empty file)"
+    except Exception as e:
+        print(f"[e2b_read] Error: {e}", flush=True)
+        return f"Error reading file: {e}"
+
+
+async def tool_e2b_gemini(path: str, query: str, chat_id: int) -> str:
+    """Send a sandbox file to Gemini for analysis."""
+    try:
+        # Download file from sandbox
+        content, error = await sandbox_manager.download_file(chat_id, path)
+        if error:
+            return f"Error: {error}"
+        if not content:
+            return "Error: Empty file"
+
+        # Determine MIME type from extension
+        ext = Path(path).suffix.lower()
+        mime_map = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".pdf": "application/pdf",
+        }
+        mime_type = mime_map.get(ext, "application/octet-stream")
+
+        # Encode and send to Gemini
+        b64 = base64.b64encode(content).decode()
+
+        # Build content based on type
+        if mime_type.startswith("image/"):
+            file_content = {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+            }
+        else:
+            # Audio, video, PDF, etc.
+            file_content = {
+                "type": "file",
+                "file": {"file_data": f"data:{mime_type};base64,{b64}"},
+            }
+
+        response = await vision_complete(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": query},
+                        file_content,
+                    ],
+                }
+            ],
+            timeout=180,  # Longer timeout for large files
+        )
+        result = response.choices[0].message.content.strip()
+        return result if result else "No response from Gemini"
+
+    except Exception as e:
+        print(f"[e2b_gemini] Error: {e}", flush=True)
+        return f"Error: {e}"
+
+
+async def tool_e2b_download(path: str, chat_id: int) -> str:
+    """Download a file from E2B sandbox and save as local attachment."""
+    try:
+        # Download from sandbox
+        content, error = await sandbox_manager.download_file(chat_id, path)
+        if error:
+            return f"Error: {error}"
+        if not content:
+            return "Error: Empty file"
+
+        # Determine extension
+        ext = Path(path).suffix.lower() or ".bin"
+
+        # Save as attachment
+        attachment_id, attachment_path = save_attachment_from_bytes(content, ext)
+        return f"Downloaded and saved as attachment: {attachment_id} ({len(content)} bytes)"
+
+    except Exception as e:
+        print(f"[e2b_download] Error: {e}", flush=True)
+        return f"Error downloading file: {e}"
+
+
 async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     """Execute a tool and return result."""
     # Async tools
@@ -1116,6 +1346,17 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_send_attachment(
             args["attachment_id"], chat_id, args.get("caption")
         )
+    # E2B sandbox tools
+    if name == "e2b_upload":
+        return await tool_e2b_upload(args["attachment_id"], chat_id)
+    if name == "e2b_run":
+        return await tool_e2b_run(args["command"], chat_id)
+    if name == "e2b_read":
+        return await tool_e2b_read(args["path"], chat_id)
+    if name == "e2b_gemini":
+        return await tool_e2b_gemini(args["path"], args["query"], chat_id)
+    if name == "e2b_download":
+        return await tool_e2b_download(args["path"], chat_id)
 
     # Sync tools - dispatch table
     dispatch = {
@@ -1851,10 +2092,14 @@ async def post_init(app) -> None:
     _bot = app.bot
     # Start the scheduler as a background task
     asyncio.create_task(scheduler_loop(app))
+    # Start the E2B sandbox manager
+    await sandbox_manager.start()
 
 
 async def post_shutdown(app) -> None:
     """Called after the application is shut down - cleanup resources."""
+    # Stop the E2B sandbox manager
+    await sandbox_manager.stop()
     # Close litellm's async HTTP clients to avoid the warning:
     # "RuntimeWarning: coroutine 'close_litellm_async_clients' was never awaited"
     try:

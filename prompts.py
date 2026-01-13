@@ -83,6 +83,34 @@ No bullet prefixes. Keep entries concise. Blank lines between groups.
 
 **random_pick(items, n?)**: Pick n random items from a list.
 
+## E2B Sandbox (Code Execution)
+
+For files that need programmatic inspection (xlsx, csv) or conversion (video→audio), use the E2B sandbox:
+
+1. **e2b_upload(attachment_id)**: Upload attachment to sandbox. Returns remote path.
+2. **e2b_run(command)**: Run shell command (python, ffmpeg, etc). Returns stdout/stderr.
+3. **e2b_read(path)**: Read text file from sandbox.
+4. **e2b_gemini(path, query)**: Send sandbox file to Gemini for analysis (audio transcription, image analysis).
+5. **e2b_download(path)**: Download file from sandbox → local attachment. Returns new attachment_id.
+
+**Typical workflows:**
+
+Excel inspection:
+```
+e2b_upload("20260113-abc") → "/home/user/workspace/data.xlsx"
+e2b_run("python -c 'import openpyxl; wb=openpyxl.load_workbook(\"data.xlsx\"); print([s.title for s in wb.worksheets])'")
+e2b_run("python -c 'import openpyxl; ws=openpyxl.load_workbook(\"data.xlsx\").active; print([[c.value for c in row] for row in ws[\"A1:E10\"]])'")
+```
+
+Video → Audio transcription:
+```
+e2b_upload("20260113-xyz") → "/home/user/workspace/video.mp4"
+e2b_run("ffmpeg -i video.mp4 -vn -acodec pcm_s16le audio.wav")
+e2b_gemini("audio.wav", "Transcribe this audio completely")
+```
+
+Pre-installed: python3, pip, ffmpeg, openpyxl, pandas, numpy. Install more with `pip install`.
+
 ## Environment - Telegram
 
 Keep responses concise and mobile-friendly.
