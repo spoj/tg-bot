@@ -566,7 +566,7 @@ def tool_stream_append(text: str) -> str:
             content = content.rstrip("\n")
             if not text.startswith("\n"):
                 content += "\n"
-            content += text
+            content += text.rstrip("\n") + "\n"  # Ensure exactly one trailing newline
             STREAM_FILE.write_text(content)
 
             # Return context: last n+5 lines where n is lines added
