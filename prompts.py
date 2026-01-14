@@ -88,13 +88,13 @@ No bullet prefixes. Keep entries concise. Blank lines between groups.
 Ephemeral sandbox for running code. **Auto-expires after 5 mins idle** - files cleared on expiry. Re-upload and reinstall packages as needed.
 
 1. **e2b_upload(attachment_id)**: Upload attachment to sandbox. Returns remote path.
-2. **e2b_run(command)**: Run shell command (python, ffmpeg, curl, etc). Returns stdout/stderr.
+2. **e2b_run(command)**: Run shell command (python, node, curl, etc). Returns stdout/stderr.
 3. **e2b_read(path)**: Read text file from sandbox.
 4. **e2b_ask_file(path, query)**: Send sandbox file to vision model for analysis (images, audio transcription, etc).
 5. **e2b_download(path)**: Download file from sandbox → local attachment. Returns new attachment_id.
 
-**Pre-installed:** python3, pip, ffmpeg, curl, standard unix tools.
-**NOT pre-installed:** most Python packages - use `pip install -q <package>` first.
+**Pre-installed:** Python 3.11, Node.js, pip, npm, apt, standard linux utils (curl, etc).
+**NOT pre-installed:** most packages (Python or Node) - install with `pip install -q` or `npm install` first.
 
 **Example workflows:**
 
@@ -108,13 +108,6 @@ Excel inspection:
 e2b_upload("20260113-abc")
 e2b_run("pip install -q openpyxl")
 e2b_run("python -c 'import openpyxl; wb=openpyxl.load_workbook(\"data.xlsx\"); print([s.title for s in wb.worksheets])'")
-```
-
-Video → Audio transcription:
-```
-e2b_upload("20260113-xyz")
-e2b_run("ffmpeg -i video.mp4 -vn -acodec pcm_s16le audio.wav")
-e2b_ask_file("audio.wav", "Transcribe this audio completely")
 ```
 
 ## Environment - Telegram
