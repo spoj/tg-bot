@@ -1696,7 +1696,19 @@ async def run_agent(
             # Return final response
             return msg.content or None
 
-        # Has tool calls - send intermediate text to user immediately (if present)
+        # Has tool calls - but check pending first!
+        # Tool call requests are disposable (not yet executed), so if user sent
+        # new messages, discard this response and let model see the new context
+        if drain_pending():
+            # New messages arrived - discard tool call request, re-call API
+            print(
+                f"[run_agent] Discarding tool call request due to pending messages",
+                flush=True,
+            )
+            continue
+
+        # No pending - safe to execute tools
+        # Send intermediate text to user immediately (if present)
         if msg.content:
             chunks = (
                 [msg.content[i : i + 4096] for i in range(0, len(msg.content), 4096)]
@@ -1730,7 +1742,8 @@ async def run_agent(
             messages.extend(tool_results)
             move_cache_control_to(len(messages) - 1)
 
-        # Loop continues - drain_pending at top will catch any queued messages
+        # Loop continues - tool results now committed, will be sent to model
+        # (pending messages already drained before tool execution)
 
     # Max iterations reached - save actual state
     history_len = len(history)
