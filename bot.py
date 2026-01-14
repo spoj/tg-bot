@@ -26,6 +26,8 @@ from models import (
     vision_complete,
     search_complete,
     long_context_complete,
+    get_content,
+    get_message,
 )
 from prompts import (
     IMAGE_DESCRIBE,
@@ -389,8 +391,8 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "e2b_gemini",
-            "description": "Send a file from the E2B sandbox to Gemini for analysis. Use for audio transcription, image analysis, or any multimodal query on sandbox files.",
+            "name": "e2b_ask_file",
+            "description": "Send a file from the E2B sandbox to vision model for analysis. Use for audio transcription, image analysis, or any multimodal query on sandbox files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -807,7 +809,7 @@ Question: {query}"""
         response = await long_context_complete(
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content.strip()
+        return get_content(response)
     except asyncio.TimeoutError:
         return "Ask stream timed out"
     except Exception as e:
@@ -928,7 +930,7 @@ async def tool_web_search(query: str) -> str:
             messages=[{"role": "user", "content": query}],
             extra_body={"plugins": [{"id": "web"}]},
         )
-        return response.choices[0].message.content.strip()
+        return get_content(response)
     except asyncio.TimeoutError:
         return "Web search timed out"
     except Exception as e:
@@ -1171,7 +1173,7 @@ async def tool_ask_attachment(attachment_id: str, question: str) -> str:
         response = await vision_complete(
             messages=[{"role": "user", "content": content}],
         )
-        result = response.choices[0].message.content.strip()
+        result = get_content(response)
         return result if result else "No response from analysis"
 
     except Exception as e:
@@ -1231,8 +1233,15 @@ async def tool_e2b_upload(attachment_id: str, chat_id: int) -> str:
     try:
         content = attachment_path.read_bytes()
         filename = attachment_path.name
-        remote_path = await sandbox_manager.upload_file(chat_id, filename, content)
-        return f"Uploaded to sandbox: {remote_path} ({len(content)} bytes)"
+        remote_path, is_new = await sandbox_manager.upload_file(
+            chat_id, filename, content
+        )
+        result = f"Uploaded to sandbox: {remote_path} ({len(content)} bytes)"
+        if is_new:
+            result = (
+                "(New sandbox created - previous files/packages cleared)\n" + result
+            )
+        return result
     except Exception as e:
         print(f"[e2b_upload] Error: {e}", flush=True)
         return f"Error uploading to sandbox: {e}"
@@ -1243,10 +1252,12 @@ async def tool_e2b_run(command: str, chat_id: int) -> str:
     try:
         result = await sandbox_manager.run_command(chat_id, command)
         output = ""
+        if result["is_new_sandbox"]:
+            output = "(New sandbox created - previous files/packages cleared)\n"
         if result["stdout"]:
             output += result["stdout"]
         if result["stderr"]:
-            if output:
+            if result["stdout"]:
                 output += "\n--- STDERR ---\n"
             output += result["stderr"]
         if not result["success"]:
@@ -1269,8 +1280,8 @@ async def tool_e2b_read(path: str, chat_id: int) -> str:
         return f"Error reading file: {e}"
 
 
-async def tool_e2b_gemini(path: str, query: str, chat_id: int) -> str:
-    """Send a sandbox file to Gemini for analysis."""
+async def tool_e2b_ask_file(path: str, query: str, chat_id: int) -> str:
+    """Send a sandbox file to vision model for analysis."""
     try:
         # Download file from sandbox
         content, error = await sandbox_manager.download_file(chat_id, path)
@@ -1310,11 +1321,11 @@ async def tool_e2b_gemini(path: str, query: str, chat_id: int) -> str:
             ],
             timeout=180,  # Longer timeout for large files
         )
-        result = response.choices[0].message.content.strip()
-        return result if result else "No response from Gemini"
+        result = get_content(response)
+        return result if result else "No response from vision model"
 
     except Exception as e:
-        print(f"[e2b_gemini] Error: {e}", flush=True)
+        print(f"[e2b_ask_file] Error: {e}", flush=True)
         return f"Error: {e}"
 
 
@@ -1362,8 +1373,8 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_e2b_run(args["command"], chat_id)
     if name == "e2b_read":
         return await tool_e2b_read(args["path"], chat_id)
-    if name == "e2b_gemini":
-        return await tool_e2b_gemini(args["path"], args["query"], chat_id)
+    if name == "e2b_ask_file":
+        return await tool_e2b_ask_file(args["path"], args["query"], chat_id)
     if name == "e2b_download":
         return await tool_e2b_download(args["path"], chat_id)
 
@@ -1429,7 +1440,7 @@ async def preprocess_image(file_path: str, caption: str = "") -> str | None:
             ],
             timeout=60,
         )
-        result = response.choices[0].message.content.strip()
+        result = get_content(response)
         if result:
             print(f"[preprocess_image] Success: {result[:50]}...", flush=True)
             return result
@@ -1464,7 +1475,7 @@ async def preprocess_audio(file_path: str) -> str | None:
                 }
             ],
         )
-        result = response.choices[0].message.content.strip()
+        result = get_content(response)
         if result:
             print(f"[preprocess_audio] Success: {result[:50]}...", flush=True)
             return result
@@ -1499,7 +1510,7 @@ async def preprocess_pdf(file_path: str) -> str | None:
             ],
             timeout=120,
         )
-        result = response.choices[0].message.content.strip()
+        result = get_content(response)
         if result:
             print(f"[preprocess_pdf] Success: {result[:50]}...", flush=True)
             return result
@@ -1624,7 +1635,7 @@ async def run_agent(
                 flush=True,
             )
 
-        msg = response.choices[0].message
+        msg = get_message(response)
 
         # Send intermediate text to user immediately (if present alongside tool calls)
         if msg.content and msg.tool_calls:
@@ -1722,7 +1733,7 @@ async def run_agent(
     )
 
     # Display-only warning (not saved to session)
-    last_content = response.choices[0].message.content if response else ""
+    last_content = get_content(response) if response else ""
     if last_content:
         return f"{last_content}\n\n(iteration limit reached)"
     return "(iteration limit reached)"
@@ -2109,14 +2120,10 @@ async def post_init(app) -> None:
     _bot = app.bot
     # Start the scheduler as a background task
     asyncio.create_task(scheduler_loop(app))
-    # Start the E2B sandbox manager
-    await sandbox_manager.start()
 
 
 async def post_shutdown(app) -> None:
     """Called after the application is shut down - cleanup resources."""
-    # Stop the E2B sandbox manager
-    await sandbox_manager.stop()
     # Close litellm's async HTTP clients to avoid the warning:
     # "RuntimeWarning: coroutine 'close_litellm_async_clients' was never awaited"
     try:

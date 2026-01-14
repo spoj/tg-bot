@@ -1,5 +1,7 @@
 """Model configuration and LLM call wrappers."""
 
+from typing import Any
+
 from litellm import acompletion
 
 # --- Configs by Purpose ---
@@ -26,6 +28,23 @@ LONG_CONTEXT = {
     "max_tokens": 8000,
     "timeout": 300,
 }
+
+
+def get_content(response: Any) -> str:
+    """Extract text content from LLM response. Handles litellm type quirks."""
+    try:
+        content = response.choices[0].message.content
+        return content.strip() if content else ""
+    except (AttributeError, IndexError, TypeError):
+        return ""
+
+
+def get_message(response: Any) -> Any:
+    """Extract message object from LLM response. Handles litellm type quirks."""
+    try:
+        return response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return None
 
 
 async def reasoning_complete(messages: list, **kwargs):

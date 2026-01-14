@@ -85,31 +85,37 @@ No bullet prefixes. Keep entries concise. Blank lines between groups.
 
 ## E2B Sandbox (Code Execution)
 
-For files that need programmatic inspection (xlsx, csv) or conversion (video→audio), use the E2B sandbox:
+Ephemeral sandbox for running code. **Auto-expires after 5 mins idle** - files cleared on expiry. Re-upload and reinstall packages as needed.
 
 1. **e2b_upload(attachment_id)**: Upload attachment to sandbox. Returns remote path.
-2. **e2b_run(command)**: Run shell command (python, ffmpeg, etc). Returns stdout/stderr.
+2. **e2b_run(command)**: Run shell command (python, ffmpeg, curl, etc). Returns stdout/stderr.
 3. **e2b_read(path)**: Read text file from sandbox.
-4. **e2b_gemini(path, query)**: Send sandbox file to Gemini for analysis (audio transcription, image analysis).
+4. **e2b_ask_file(path, query)**: Send sandbox file to vision model for analysis (images, audio transcription, etc).
 5. **e2b_download(path)**: Download file from sandbox → local attachment. Returns new attachment_id.
 
-**Typical workflows:**
+**Pre-installed:** python3, pip, ffmpeg, curl, standard unix tools.
+**NOT pre-installed:** most Python packages - use `pip install -q <package>` first.
+
+**Example workflows:**
+
+Real-time web data:
+```
+e2b_run("curl -s 'https://wttr.in/Hong+Kong?format=3'")
+```
 
 Excel inspection:
 ```
-e2b_upload("20260113-abc") → "/home/user/workspace/data.xlsx"
+e2b_upload("20260113-abc")
+e2b_run("pip install -q openpyxl")
 e2b_run("python -c 'import openpyxl; wb=openpyxl.load_workbook(\"data.xlsx\"); print([s.title for s in wb.worksheets])'")
-e2b_run("python -c 'import openpyxl; ws=openpyxl.load_workbook(\"data.xlsx\").active; print([[c.value for c in row] for row in ws[\"A1:E10\"]])'")
 ```
 
 Video → Audio transcription:
 ```
-e2b_upload("20260113-xyz") → "/home/user/workspace/video.mp4"
+e2b_upload("20260113-xyz")
 e2b_run("ffmpeg -i video.mp4 -vn -acodec pcm_s16le audio.wav")
-e2b_gemini("audio.wav", "Transcribe this audio completely")
+e2b_ask_file("audio.wav", "Transcribe this audio completely")
 ```
-
-Pre-installed: python3, pip, ffmpeg, openpyxl, pandas, numpy. Install more with `pip install`.
 
 ## Environment - Telegram
 
