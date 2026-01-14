@@ -358,13 +358,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "e2b_run",
-            "description": "Run a shell command in the E2B sandbox. Use for Python scripts, ffmpeg, etc. Returns stdout/stderr. Working dir: /home/user/workspace. Pre-installed: python, pip, ffmpeg, openpyxl, pandas, numpy.",
+            "description": "Run a shell command in the E2B sandbox. Returns stdout/stderr. Working dir: /home/user/workspace. Pre-installed: Python 3.11, Node.js, pip, npm, apt, standard linux utils. Most packages need installing first.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command to execute (e.g., 'python script.py', 'ffmpeg -i video.mp4 audio.wav')",
+                        "description": "Shell command to execute (e.g., 'python script.py', 'pip install pandas')",
                     },
                 },
                 "required": ["command"],
