@@ -445,9 +445,9 @@ def get_session(chat_id: int) -> list[dict]:
             del sessions[chat_id]
         else:
             session["last_used"] = now
-            # Ensure lock and interrupt exist (for safety if session structure changes)
+            # Ensure lock and pending_messages exist (for safety if session structure changes)
             session.setdefault("lock", asyncio.Lock())
-            session.setdefault("interrupt", asyncio.Event())
+            session.setdefault("pending_messages", [])
             return session["messages"]
 
     # New session
@@ -455,7 +455,7 @@ def get_session(chat_id: int) -> list[dict]:
         "messages": [],
         "last_used": now,
         "lock": asyncio.Lock(),
-        "interrupt": asyncio.Event(),
+        "pending_messages": [],  # queued user messages while agent is running
     }
     return sessions[chat_id]["messages"]
 
@@ -1526,25 +1526,25 @@ async def preprocess_pdf(file_path: str) -> str | None:
 async def run_agent(
     user_message: str,
     chat_id: int,
-    user_id: int | None = None,
-    interrupt: asyncio.Event | None = None,
 ) -> str | None:
-    """Run the Opus agent loop with tools. Returns None if interrupted."""
+    """Run the Opus agent loop with tools.
+
+    Message batching: If new messages arrive while running, they are queued
+    in session["pending_messages"] and injected as additional user messages.
+    LLM responses (text or tool requests) are disposable and can be discarded
+    when new messages arrive. Tool results are NOT disposable - once tools
+    execute, their results must be sent to the LLM.
+    """
     system_prompt = get_system_prompt()
     history = get_session(chat_id)
-
-    # Inject time and user identity into the current user message
-    # This preserves system prompt caching while giving the model (and history) context
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-    user_name = USER_NAMES.get(user_id, "Unknown") if user_id else "Unknown"
-    user_message = f"[{current_time}] [{user_name}] {user_message}"
+    session = sessions[chat_id]
 
     # Build messages for API with cache control on user message
     # This enables Anthropic prompt caching via OpenRouter (90% cost reduction on cache hits)
     # Cache breakpoint on user message = cache system + history + user message
     # Tool loop iterations 2+ hit cache, only paying for new assistant/tool messages
     # NOTE: Must use content block format (array with cache_control inside) for OpenRouter
-    messages = [{"role": "system", "content": system_prompt}]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
     # Strip any stale cache_control from history (they persist from previous sessions)
     # Anthropic allows max 4 cache_control blocks per request
@@ -1560,21 +1560,66 @@ async def run_agent(
         return {**msg, "content": new_content}
 
     messages.extend(strip_cache_control(m) for m in history)
+
     # Track which message index has the cache_control (for moving it later)
     # Initially cache the user message; will move to latest tool result each iteration
     cache_control_idx = len(messages)  # Index of the message we're about to append
-    messages.append(
-        {
-            "role": "user",
-            "content": [
+
+    def make_user_msg(text: str, with_cache: bool = False) -> dict:
+        """Create a user message, optionally with cache_control."""
+        if with_cache:
+            return {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": text,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        return {"role": "user", "content": text}
+
+    def move_cache_control_to(idx: int):
+        """Move cache_control from current location to new index."""
+        nonlocal cache_control_idx
+        # Remove from previous
+        prev_msg = messages[cache_control_idx]
+        if isinstance(prev_msg.get("content"), list) and prev_msg["content"]:
+            if isinstance(prev_msg["content"][0], dict):
+                prev_msg["content"][0].pop("cache_control", None)
+        # Add to new
+        new_msg = messages[idx]
+        if isinstance(new_msg.get("content"), str):
+            # Convert string content to block format with cache_control
+            new_msg["content"] = [
                 {
                     "type": "text",
-                    "text": user_message,
+                    "text": new_msg["content"],
                     "cache_control": {"type": "ephemeral"},
                 }
-            ],
-        }
-    )
+            ]
+        elif isinstance(new_msg.get("content"), list) and new_msg["content"]:
+            if isinstance(new_msg["content"][0], dict):
+                new_msg["content"][0]["cache_control"] = {"type": "ephemeral"}
+        cache_control_idx = idx
+
+    def drain_pending() -> bool:
+        """Drain pending messages into messages list. Returns True if any were added."""
+        nonlocal cache_control_idx
+        if not session["pending_messages"]:
+            return False
+        pending = session["pending_messages"][:]
+        session["pending_messages"].clear()
+        print(f"[run_agent] Draining {len(pending)} pending messages", flush=True)
+        for text in pending:
+            messages.append(make_user_msg(text))
+        # Move cache_control to last user message
+        move_cache_control_to(len(messages) - 1)
+        return True
+
+    # Add initial user message with cache_control
+    messages.append(make_user_msg(user_message, with_cache=True))
 
     # Hash the history prefix for consistency verification
     history_hash = hash_messages(history) if history else "empty"
@@ -1583,21 +1628,11 @@ async def run_agent(
         flush=True,
     )
 
-    def save_partial():
-        """Save partial work to session when interrupted."""
-        nonlocal history
-        history_len = len(history)
-        add_message_to_session(chat_id, {"role": "user", "content": user_message})
-        for m in messages[history_len + 2 :]:
-            add_message_to_session(chat_id, m)
-
     response = None
 
     for iteration in range(MAX_TOOL_ITERATIONS):
-        # Check for interrupt before API call
-        if interrupt and interrupt.is_set():
-            save_partial()
-            return None
+        # Drain any pending messages before API call
+        drain_pending()
 
         # Log cumulative prefix hashes for each message (for cache consistency verification)
         prefix_hashes = [hash_messages(messages[: i + 1]) for i in range(len(messages))]
@@ -1637,8 +1672,32 @@ async def run_agent(
 
         msg = get_message(response)
 
-        # Send intermediate text to user immediately (if present alongside tool calls)
-        if msg.content and msg.tool_calls:
+        # Check if done (no tool calls)
+        if not msg.tool_calls:
+            # Check for pending messages one more time
+            if drain_pending():
+                # New messages arrived - discard this response, re-call API
+                continue
+
+            # Truly done - save to session and return
+            # Save: all user messages + tool calls/results + final response
+            history_len = len(history)
+            # Skip: system (1) + history (history_len) = history_len + 1
+            for m in messages[history_len + 1 :]:
+                add_message_to_session(chat_id, m)
+            add_message_to_session(chat_id, build_assistant_msg(msg))
+
+            session_now = get_session(chat_id)
+            print(
+                f"[run_agent] Saved {len(session_now) - history_len} new messages (total: {len(session_now)}, hash: {hash_messages(session_now)})",
+                flush=True,
+            )
+
+            # Return final response
+            return msg.content or None
+
+        # Has tool calls - send intermediate text to user immediately (if present)
+        if msg.content:
             chunks = (
                 [msg.content[i : i + 4096] for i in range(0, len(msg.content), 4096)]
                 if len(msg.content) > 4096
@@ -1652,36 +1711,11 @@ async def run_agent(
                 except TelegramError:
                     await _bot.send_message(chat_id=chat_id, text=chunk)
 
-        # Check if done (no tool calls)
-        if not msg.tool_calls:
-            # Check for interrupt before returning final result
-            if interrupt and interrupt.is_set():
-                save_partial()
-                return None
-
-            # Save to session: user + all intermediate messages + final response (actual content)
-            history_len = len(history)
-            add_message_to_session(chat_id, {"role": "user", "content": user_message})
-            # Skip: system (1) + history (history_len) + initial user msg (1) = history_len + 2
-            for m in messages[history_len + 2 :]:
-                add_message_to_session(chat_id, m)
-            add_message_to_session(chat_id, build_assistant_msg(msg))  # Actual response
-
-            session_now = get_session(chat_id)
-            print(
-                f"[run_agent] Saved {len(session_now) - history_len} new messages (total: {len(session_now)}, hash: {hash_messages(session_now)})",
-                flush=True,
-            )
-
-            # Return final response only (ignore intermediate "thinking" text)
-            # Return None if no content (e.g., tool-only response) - caller will skip sending
-            return msg.content or None
-
-        # Process tool calls - build message preserving all fields
+        # Commit: append assistant message with tool calls (we're about to execute them)
         assistant_msg = build_assistant_msg(msg)
         messages.append(assistant_msg)
 
-        # Execute ALL tool calls in parallel before checking interrupt
+        # Execute ALL tool calls in parallel - NOT interruptible
         # (tools may have side effects, API requires all tool_calls to have matching results)
         async def run_tool(tc):
             fn_name = tc.function.name
@@ -1691,39 +1725,16 @@ async def run_agent(
 
         tool_results = await asyncio.gather(*[run_tool(tc) for tc in msg.tool_calls])
 
-        # Move cache_control from previous location to last tool result
-        # Only one cache breakpoint allowed per API call
+        # Append tool results and move cache_control to last result
         if tool_results:
-            # Remove cache_control from previous cached message
-            prev_msg = messages[cache_control_idx]
-            if isinstance(prev_msg.get("content"), list) and prev_msg["content"]:
-                prev_msg["content"][0].pop("cache_control", None)
-
-            # Add cache_control to the last tool result
-            last_result = tool_results[-1]
-            last_result["content"] = [
-                {
-                    "type": "text",
-                    "text": last_result["content"],
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ]
-
             messages.extend(tool_results)
-            # Update cache_control_idx to point to the new cached message
-            cache_control_idx = len(messages) - 1
-        else:
-            messages.extend(tool_results)
+            move_cache_control_to(len(messages) - 1)
 
-        # Check for interrupt after all tools complete
-        if interrupt and interrupt.is_set():
-            save_partial()
-            return None
+        # Loop continues - drain_pending at top will catch any queued messages
 
-    # Max iterations reached - save actual state (no synthetic message)
+    # Max iterations reached - save actual state
     history_len = len(history)
-    add_message_to_session(chat_id, {"role": "user", "content": user_message})
-    for m in messages[history_len + 2 :]:
+    for m in messages[history_len + 1 :]:
         add_message_to_session(chat_id, m)
 
     session_now = get_session(chat_id)
@@ -1941,21 +1952,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     get_session(chat_id)  # Ensure session exists
     session = sessions[chat_id]
 
-    # Signal interrupt if lock is already held (another run in progress)
+    # Inject time and user identity into the user message
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+    user_name = USER_NAMES.get(user_id, "Unknown") if user_id else "Unknown"
+    formatted_text = f"[{current_time}] [{user_name}] {text}"
+
+    # If agent is running, queue message and return immediately (don't wait)
     if session["lock"].locked():
-        session["interrupt"].set()
+        session["pending_messages"].append(formatted_text)
+        print(
+            f"[handle_message] Queued message (pending={len(session['pending_messages'])})",
+            flush=True,
+        )
+        return
 
     async with session["lock"]:
-        session["interrupt"].clear()
-
         response = await run_agent(
-            text,
+            formatted_text,
             chat_id,
-            user_id,
-            interrupt=session["interrupt"],
         )
 
-        # Interrupted or no content - nothing to send
+        # No content - nothing to send
         if not response:
             return
 
