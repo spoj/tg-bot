@@ -47,6 +47,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -2219,9 +2220,15 @@ def main() -> None:
     # Ensure attachments directory exists
     ATTACHMENTS_DIR.mkdir(exist_ok=True)
 
+    # Use HTTPXRequest without proxy for Telegram API (proxy is for Gemini geo-bypass only)
+    # This avoids "TTL expired" errors when the SOCKS proxy has issues
+    request = HTTPXRequest(proxy=None)
+
     app = (
         Application.builder()
         .token(TOKEN)
+        .request(request)
+        .get_updates_request(request)
         .concurrent_updates(True)  # Allow handlers to run concurrently
         .post_init(post_init)
         .post_shutdown(post_shutdown)
