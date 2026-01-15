@@ -10,6 +10,13 @@ REASONING = {
     "reasoning": {"effort": "high"},
     "max_tokens": 16000,
     "timeout": 600,
+    # OpenRouter: route to Google Vertex only (avoid Bedrock prompt caching issues)
+    "extra_body": {
+        "provider": {
+            "order": ["anthropic"],
+            "allow_fallbacks": False,
+        }
+    },
 }
 
 VISION = {

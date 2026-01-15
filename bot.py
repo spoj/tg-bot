@@ -1641,16 +1641,71 @@ async def run_agent(
             flush=True,
         )
 
-        try:
-            response = await reasoning_complete(
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
+        # Retry logic for transient API errors
+        max_retries = 3
+        retry_delay = 2  # seconds, will double each retry
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                response = await reasoning_complete(
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
+                break  # Success, exit retry loop
+            except (
+                litellm.RateLimitError,
+                litellm.APIError,
+                litellm.ServiceUnavailableError,
+                litellm.InternalServerError,
+                litellm.APIConnectionError,
+            ) as e:
+                last_error = e
+                error_msg = str(e).lower()
+                # Retry on transient errors (check error message for specific patterns)
+                is_transient = any(
+                    x in error_msg
+                    for x in [
+                        "overloaded",
+                        "rate",
+                        "internal server",
+                        "503",
+                        "429",
+                        "timeout",
+                        "connection",
+                    ]
+                )
+                # Also retry all RateLimitError, ServiceUnavailableError, InternalServerError unconditionally
+                is_transient = is_transient or isinstance(
+                    e,
+                    (
+                        litellm.RateLimitError,
+                        litellm.ServiceUnavailableError,
+                        litellm.InternalServerError,
+                    ),
+                )
+                if is_transient and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2**attempt)
+                    print(
+                        f"[run_agent] Transient API error (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}",
+                        flush=True,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                # Non-retryable or max retries exhausted
+                print(f"[run_agent] API error: {e}", flush=True)
+                return f"API error: {e}"
+            except Exception as e:
+                print(f"[run_agent] API error: {e}", flush=True)
+                return f"API error: {e}"
+        else:
+            # All retries exhausted
+            print(
+                f"[run_agent] API error after {max_retries} retries: {last_error}",
+                flush=True,
             )
-        except Exception as e:
-            print(f"[run_agent] API error: {e}", flush=True)
-            # Return error to user
-            return f"API error: {e}"
+            return f"API error (after {max_retries} retries): {last_error}"
 
         # Log cache stats from response usage
         # LiteLLM puts cache info in usage.prompt_tokens_details
@@ -2020,11 +2075,9 @@ async def process_wakeup(wakeup: dict, bot) -> None:
 
     try:
         # Run agent with the wakeup prompt
-        # Use a synthetic user_id (0) to indicate this is a scheduled message
         response = await run_agent(
             f"[SCHEDULED WAKEUP] {prompt}",
             chat_id,
-            0,  # System/scheduled user ID
         )
 
         # Send the response
