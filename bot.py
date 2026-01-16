@@ -20,14 +20,23 @@ import litellm
 # Force httpx transport for SOCKS proxy support (aiohttp doesn't handle SOCKS properly)
 litellm.disable_aiohttp_transport = True
 
-from models import (
-    REASONING,
-    reasoning_complete,
-    vision_complete,
-    search_complete,
-    long_context_complete,
-    get_content,
-    get_message,
+from session import (
+    Session,
+    Message,
+    MessageRole,
+    ToolCall,
+    ToolResult,
+    Attachment,
+    get_session as get_session_store,
+    clear_session as clear_session_store,
+    get_all_sessions,
+)
+from adapters import (
+    ModelAdapter,
+    get_reasoning_adapter,
+    get_vision_adapter,
+    get_long_context_adapter,
+    get_search_adapter,
 )
 from prompts import (
     IMAGE_DESCRIBE,
@@ -82,9 +91,6 @@ STREAM_LOCK = DATA_DIR / ".stream.txt.lock"
 
 # Global bot reference for tools that need to send messages
 _bot = None
-
-# In-memory sessions: {chat_id: {"messages": [...], "last_used": timestamp}}
-sessions: dict[int, dict] = {}
 
 
 # Tool definitions for Opus
@@ -435,73 +441,35 @@ def get_system_prompt() -> str:
     return SYSTEM_PROMPT.format(owner_name=OWNER_NAME)
 
 
-def get_session(chat_id: int) -> list[dict]:
-    """Get or create session for chat, handling timeout."""
-    now = time.time()
+def get_session(chat_id: int) -> Session:
+    """Get or create session for chat, handling timeout.
 
-    if chat_id in sessions:
-        session = sessions[chat_id]
-        if now - session["last_used"] > SESSION_TIMEOUT:
-            # Expired
-            del sessions[chat_id]
-        else:
-            session["last_used"] = now
-            # Ensure lock and pending_messages exist (for safety if session structure changes)
-            session.setdefault("lock", asyncio.Lock())
-            session.setdefault("pending_messages", [])
-            return session["messages"]
-
-    # New session
-    sessions[chat_id] = {
-        "messages": [],
-        "last_used": now,
-        "lock": asyncio.Lock(),
-        "pending_messages": [],  # queued user messages while agent is running
-    }
-    return sessions[chat_id]["messages"]
-
-
-def build_assistant_msg(msg) -> dict:
-    """Build assistant message dict preserving all API-relevant fields."""
-    result = {"role": "assistant", "content": msg.content}
-
-    if msg.tool_calls:
-        result["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments or "{}",
-                },
-            }
-            for tc in msg.tool_calls
-        ]
-
-    # Preserve reasoning (OpenRouter format)
-    provider_fields = getattr(msg, "provider_specific_fields", None) or {}
-    if provider_fields.get("reasoning_details"):
-        result["reasoning_details"] = provider_fields["reasoning_details"]
-
-    return result
-
-
-def hash_messages(messages: list[dict]) -> str:
-    """Hash a list of messages for prefix consistency verification."""
-    serialized = json.dumps(messages, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(serialized.encode()).hexdigest()[:12]
-
-
-def add_message_to_session(chat_id: int, message: dict) -> None:
-    """Add a message dict to session history verbatim for prefix consistency."""
-    messages = get_session(chat_id)
-    messages.append(message)
+    This is a compatibility wrapper around the session module.
+    """
+    return get_session_store(chat_id, timeout=SESSION_TIMEOUT)
 
 
 def clear_session(chat_id: int) -> None:
     """Clear session for chat."""
-    if chat_id in sessions:
-        del sessions[chat_id]
+    clear_session_store(chat_id)
+
+
+def hash_messages(messages: list[Message]) -> str:
+    """Hash a list of messages for prefix consistency verification."""
+
+    # Convert semantic messages to a hashable representation
+    def msg_to_dict(m: Message) -> dict:
+        return {
+            "role": m.role.value,
+            "content": m.content,
+            "tool_calls": [(tc.name, tc.arguments, tc.call_id) for tc in m.tool_calls],
+            "tool_results": [(tr.call_id, tr.content) for tr in m.tool_results],
+        }
+
+    serialized = json.dumps(
+        [msg_to_dict(m) for m in messages], sort_keys=True, ensure_ascii=False
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()[:12]
 
 
 # --- Attachment storage ---
@@ -807,10 +775,13 @@ Stream content ({total} lines):
 Question: {query}"""
 
     try:
-        response = await long_context_complete(
-            messages=[{"role": "user", "content": prompt}],
+        adapter = get_long_context_adapter()
+        msg = Message(role=MessageRole.USER, content=prompt)
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
         )
-        return get_content(response)
+        return response.content or ""
     except asyncio.TimeoutError:
         return "Ask stream timed out"
     except Exception as e:
@@ -927,11 +898,14 @@ def tool_session_brief() -> str:
 async def tool_web_search(query: str) -> str:
     """Web search using Grok online via OpenRouter."""
     try:
-        response = await search_complete(
-            messages=[{"role": "user", "content": query}],
+        adapter = get_search_adapter()
+        msg = Message(role=MessageRole.USER, content=query)
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
             extra_body={"plugins": [{"id": "web"}]},
         )
-        return get_content(response)
+        return response.content or ""
     except asyncio.TimeoutError:
         return "Web search timed out"
     except Exception as e:
@@ -1136,46 +1110,29 @@ async def tool_ask_attachment(attachment_id: str, question: str) -> str:
     if not attachment_path:
         return f"Error: Attachment {attachment_id} not found"
 
-    attachment_type = get_attachment_type(attachment_path)
-
     try:
         file_bytes = attachment_path.read_bytes()
         b64 = base64.b64encode(file_bytes).decode()
         mime_type = get_mime_type(attachment_path)
 
-        # Build the appropriate message based on type
-        if attachment_type == "image":
-            content = [
-                {"type": "text", "text": question},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-                },
-            ]
-        elif attachment_type in ("voice", "audio", "video", "pdf"):
-            # Audio, video, PDF all use file format
-            content = [
-                {"type": "text", "text": question},
-                {
-                    "type": "file",
-                    "file": {"file_data": f"data:{mime_type};base64,{b64}"},
-                },
-            ]
-        else:
-            # Unknown type - try as file anyway, Gemini might handle it
-            content = [
-                {"type": "text", "text": question},
-                {
-                    "type": "file",
-                    "file": {"file_data": f"data:{mime_type};base64,{b64}"},
-                },
-            ]
-
-        response = await vision_complete(
-            messages=[{"role": "user", "content": content}],
+        # Build message with attachment
+        attachment = Attachment(
+            attachment_id=attachment_id,
+            mime_type=mime_type,
+            data_b64=b64,
         )
-        result = get_content(response)
-        return result if result else "No response from analysis"
+        msg = Message(
+            role=MessageRole.USER,
+            content=question,
+            attachments=[attachment],
+        )
+
+        adapter = get_vision_adapter()
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
+        )
+        return response.content if response.content else "No response from analysis"
 
     except Exception as e:
         print(f"[ask_attachment] Error: {e}", flush=True)
@@ -1294,36 +1251,26 @@ async def tool_e2b_ask_file(path: str, query: str, chat_id: int) -> str:
         # Determine MIME type from extension (reuse get_mime_type)
         mime_type = get_mime_type(Path(path))
 
-        # Encode and send to Gemini
+        # Encode and build attachment
         b64 = base64.b64encode(content).decode()
+        attachment = Attachment(
+            attachment_id=f"sandbox:{path}",
+            mime_type=mime_type,
+            data_b64=b64,
+        )
+        msg = Message(
+            role=MessageRole.USER,
+            content=query,
+            attachments=[attachment],
+        )
 
-        # Build content based on type
-        if mime_type.startswith("image/"):
-            file_content = {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-            }
-        else:
-            # Audio, video, PDF, and anything else - try as file
-            file_content = {
-                "type": "file",
-                "file": {"file_data": f"data:{mime_type};base64,{b64}"},
-            }
-
-        response = await vision_complete(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": query},
-                        file_content,
-                    ],
-                }
-            ],
+        adapter = get_vision_adapter()
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
             timeout=180,  # Longer timeout for large files
         )
-        result = get_content(response)
-        return result if result else "No response from vision model"
+        return response.content if response.content else "No response from vision model"
 
     except Exception as e:
         print(f"[e2b_ask_file] Error: {e}", flush=True)
@@ -1426,22 +1373,24 @@ async def preprocess_image(file_path: str, caption: str = "") -> str | None:
         b64 = base64.b64encode(image_bytes).decode()
         mime_type = get_mime_type(Path(file_path))
 
-        response = await vision_complete(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-                        },
-                    ],
-                }
-            ],
+        attachment = Attachment(
+            attachment_id="preprocess",
+            mime_type=mime_type,
+            data_b64=b64,
+        )
+        msg = Message(
+            role=MessageRole.USER,
+            content=prompt,
+            attachments=[attachment],
+        )
+
+        adapter = get_vision_adapter()
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
             timeout=60,
         )
-        result = get_content(response)
+        result = response.content
         if result:
             print(f"[preprocess_image] Success: {result[:50]}...", flush=True)
             return result
@@ -1459,24 +1408,23 @@ async def preprocess_audio(file_path: str) -> str | None:
         b64 = base64.b64encode(audio_bytes).decode()
         mime_type = get_mime_type(Path(file_path))
 
-        response = await vision_complete(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": AUDIO_TRANSCRIBE,
-                        },
-                        {
-                            "type": "file",
-                            "file": {"file_data": f"data:{mime_type};base64,{b64}"},
-                        },
-                    ],
-                }
-            ],
+        attachment = Attachment(
+            attachment_id="preprocess",
+            mime_type=mime_type,
+            data_b64=b64,
         )
-        result = get_content(response)
+        msg = Message(
+            role=MessageRole.USER,
+            content=AUDIO_TRANSCRIBE,
+            attachments=[attachment],
+        )
+
+        adapter = get_vision_adapter()
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
+        )
+        result = response.content
         if result:
             print(f"[preprocess_audio] Success: {result[:50]}...", flush=True)
             return result
@@ -1493,25 +1441,24 @@ async def preprocess_pdf(file_path: str) -> str | None:
         pdf_bytes = Path(file_path).read_bytes()
         b64 = base64.b64encode(pdf_bytes).decode()
 
-        response = await vision_complete(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": PDF_SUMMARIZE,
-                        },
-                        {
-                            "type": "file",
-                            "file": {"file_data": f"data:application/pdf;base64,{b64}"},
-                        },
-                    ],
-                }
-            ],
+        attachment = Attachment(
+            attachment_id="preprocess",
+            mime_type="application/pdf",
+            data_b64=b64,
+        )
+        msg = Message(
+            role=MessageRole.USER,
+            content=PDF_SUMMARIZE,
+            attachments=[attachment],
+        )
+
+        adapter = get_vision_adapter()
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
             timeout=120,
         )
-        result = get_content(response)
+        result = response.content
         if result:
             print(f"[preprocess_pdf] Success: {result[:50]}...", flush=True)
             return result
@@ -1527,144 +1474,89 @@ async def preprocess_pdf(file_path: str) -> str | None:
 async def run_agent(
     user_message: str,
     chat_id: int,
+    adapter: ModelAdapter | None = None,
+    session: Session | None = None,
 ) -> str | None:
-    """Run the Opus agent loop with tools.
+    """Run the agent loop with tools.
 
     Message batching: If new messages arrive while running, they are queued
-    in session["pending_messages"] and injected as additional user messages.
+    in session.pending_messages and injected as additional user messages.
     LLM responses (text or tool requests) are disposable and can be discarded
     when new messages arrive. Tool results are NOT disposable - once tools
     execute, their results must be sent to the LLM.
+
+    Args:
+        user_message: The user's message to process.
+        chat_id: The chat ID for session management.
+        adapter: Optional model adapter (defaults to reasoning adapter).
+        session: Optional session override (for subagents with isolated context).
+
+    Returns:
+        The final response text, or None if no response.
     """
+    # Default to main reasoning adapter
+    if adapter is None:
+        adapter = get_reasoning_adapter()
+
+    # Get session (or use provided one for subagents)
+    if session is None:
+        session = get_session(chat_id)
+
     system_prompt = get_system_prompt()
-    history = get_session(chat_id)
-    session = sessions[chat_id]
 
-    # Build messages for API with cache control on user message
-    # This enables Anthropic prompt caching via OpenRouter (90% cost reduction on cache hits)
-    # Cache breakpoint on user message = cache system + history + user message
-    # Tool loop iterations 2+ hit cache, only paying for new assistant/tool messages
-    # NOTE: Must use content block format (array with cache_control inside) for OpenRouter
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-
-    # Strip any stale cache_control from history (they persist from previous sessions)
-    # Anthropic allows max 4 cache_control blocks per request
-    def strip_cache_control(msg: dict) -> dict:
-        """Return a copy of the message with cache_control removed from content blocks."""
-        if not isinstance(msg.get("content"), list):
-            return msg
-        new_content = []
-        for block in msg["content"]:
-            if isinstance(block, dict) and "cache_control" in block:
-                block = {k: v for k, v in block.items() if k != "cache_control"}
-            new_content.append(block)
-        return {**msg, "content": new_content}
-
-    messages.extend(strip_cache_control(m) for m in history)
-
-    # Track which message index has the cache_control (for moving it later)
-    # Initially cache the user message; will move to latest tool result each iteration
-    cache_control_idx = len(messages)  # Index of the message we're about to append
-
-    def make_user_msg(text: str, with_cache: bool = False) -> dict:
-        """Create a user message, optionally with cache_control."""
-        if with_cache:
-            return {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": text,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-            }
-        return {"role": "user", "content": text}
-
-    def move_cache_control_to(idx: int):
-        """Move cache_control from current location to new index."""
-        nonlocal cache_control_idx
-        # Remove from previous
-        prev_msg = messages[cache_control_idx]
-        if isinstance(prev_msg.get("content"), list) and prev_msg["content"]:
-            if isinstance(prev_msg["content"][0], dict):
-                prev_msg["content"][0].pop("cache_control", None)
-        # Add to new
-        new_msg = messages[idx]
-        if isinstance(new_msg.get("content"), str):
-            # Convert string content to block format with cache_control
-            new_msg["content"] = [
-                {
-                    "type": "text",
-                    "text": new_msg["content"],
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ]
-        elif isinstance(new_msg.get("content"), list) and new_msg["content"]:
-            if isinstance(new_msg["content"][0], dict):
-                new_msg["content"][0]["cache_control"] = {"type": "ephemeral"}
-        cache_control_idx = idx
-
-    def drain_pending() -> bool:
-        """Drain pending messages into messages list. Returns True if any were added."""
-        nonlocal cache_control_idx
-        if not session["pending_messages"]:
-            return False
-        pending = session["pending_messages"][:]
-        session["pending_messages"].clear()
-        print(f"[run_agent] Draining {len(pending)} pending messages", flush=True)
-        for text in pending:
-            messages.append(make_user_msg(text))
-        # Move cache_control to last user message
-        move_cache_control_to(len(messages) - 1)
-        return True
-
-    # Add initial user message with cache_control
-    messages.append(make_user_msg(user_message, with_cache=True))
+    # Add user message to session
+    user_msg = Message(role=MessageRole.USER, content=user_message)
+    session.messages.append(user_msg)
 
     # Hash the history prefix for consistency verification
-    history_hash = hash_messages(history) if history else "empty"
+    history_len = len(session.messages) - 1  # Exclude the message we just added
+    history_hash = (
+        hash_messages(session.messages[:history_len]) if history_len > 0 else "empty"
+    )
     print(
-        f"[run_agent] chat_id={chat_id}, history={len(history)}, messages={len(messages)}, history_hash={history_hash}",
+        f"[run_agent] chat_id={chat_id}, model={adapter.model_name}, history={history_len}, history_hash={history_hash}",
         flush=True,
     )
 
-    response = None
+    def drain_pending() -> bool:
+        """Drain pending messages into session. Returns True if any were added."""
+        if not session.pending_messages:
+            return False
+        pending = session.pending_messages[:]
+        session.pending_messages.clear()
+        print(f"[run_agent] Draining {len(pending)} pending messages", flush=True)
+        for text in pending:
+            session.messages.append(Message(role=MessageRole.USER, content=text))
+        return True
+
+    response_msg: Message | None = None
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         # Drain any pending messages before API call
         drain_pending()
 
-        # Log cumulative prefix hashes for each message (for cache consistency verification)
-        prefix_hashes = [hash_messages(messages[: i + 1]) for i in range(len(messages))]
         print(
-            f"[run_agent] API call iteration={iteration}, hashes={','.join(prefix_hashes)}",
+            f"[run_agent] API call iteration={iteration}, messages={len(session.messages)}",
             flush=True,
         )
 
         # Retry logic for transient API errors
         max_retries = 3
         retry_delay = 2  # seconds, will double each retry
-        last_error = None
+        last_error: Exception | None = None
 
         for attempt in range(max_retries):
             try:
-                response = await reasoning_complete(
-                    messages=messages,
+                response_msg, usage = await adapter.complete(
+                    system_prompt=system_prompt,
+                    messages=session.messages,
                     tools=TOOLS,
-                    tool_choice="auto",
                 )
                 break  # Success, exit retry loop
-            except (
-                litellm.RateLimitError,
-                litellm.APIError,
-                litellm.ServiceUnavailableError,
-                litellm.InternalServerError,
-                litellm.APIConnectionError,
-            ) as e:
+            except Exception as e:
                 last_error = e
                 error_msg = str(e).lower()
-                # Retry on transient errors (check error message for specific patterns)
+                # Retry on transient errors
                 is_transient = any(
                     x in error_msg
                     for x in [
@@ -1675,16 +1567,9 @@ async def run_agent(
                         "429",
                         "timeout",
                         "connection",
+                        "ratelimit",
+                        "service unavailable",
                     ]
-                )
-                # Also retry all RateLimitError, ServiceUnavailableError, InternalServerError unconditionally
-                is_transient = is_transient or isinstance(
-                    e,
-                    (
-                        litellm.RateLimitError,
-                        litellm.ServiceUnavailableError,
-                        litellm.InternalServerError,
-                    ),
                 )
                 if is_transient and attempt < max_retries - 1:
                     wait_time = retry_delay * (2**attempt)
@@ -1697,9 +1582,6 @@ async def run_agent(
                 # Non-retryable or max retries exhausted
                 print(f"[run_agent] API error: {e}", flush=True)
                 return f"API error: {e}"
-            except Exception as e:
-                print(f"[run_agent] API error: {e}", flush=True)
-                return f"API error: {e}"
         else:
             # All retries exhausted
             print(
@@ -1708,49 +1590,33 @@ async def run_agent(
             )
             return f"API error (after {max_retries} retries): {last_error}"
 
-        # Log cache stats from response usage
-        # LiteLLM puts cache info in usage.prompt_tokens_details
-        usage = getattr(response, "usage", None)
+        # Log usage stats
         if usage:
-            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-            output_tokens = getattr(usage, "completion_tokens", 0) or 0
-            # Extract cache stats from prompt_tokens_details (LiteLLM format)
-            details = getattr(usage, "prompt_tokens_details", None)
-            cache_read = 0
-            cache_write = 0
-            if details:
-                cache_read = getattr(details, "cached_tokens", 0) or 0
-                cache_write = getattr(details, "cache_write_tokens", 0) or 0
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            cache_read = usage.get("cache_read", 0)
+            cache_write = usage.get("cache_write", 0)
             print(
                 f"[run_agent] tokens: in={input_tokens} out={output_tokens} cache_write={cache_write} cache_read={cache_read}",
                 flush=True,
             )
 
-        msg = get_message(response)
-
         # Check if done (no tool calls)
-        if not msg.tool_calls:
+        if not response_msg.tool_calls:
             # Check for pending messages one more time
             if drain_pending():
                 # New messages arrived - discard this response, re-call API
                 continue
 
             # Truly done - save to session and return
-            # Save: all user messages + tool calls/results + final response
-            history_len = len(history)
-            # Skip: system (1) + history (history_len) = history_len + 1
-            for m in messages[history_len + 1 :]:
-                add_message_to_session(chat_id, m)
-            add_message_to_session(chat_id, build_assistant_msg(msg))
+            session.messages.append(response_msg)
 
-            session_now = get_session(chat_id)
             print(
-                f"[run_agent] Saved {len(session_now) - history_len} new messages (total: {len(session_now)}, hash: {hash_messages(session_now)})",
+                f"[run_agent] Done. Total messages: {len(session.messages)}",
                 flush=True,
             )
 
-            # Return final response
-            return msg.content or None
+            return response_msg.content
 
         # Has tool calls - but check pending first!
         # Tool call requests are disposable (not yet executed), so if user sent
@@ -1758,18 +1624,21 @@ async def run_agent(
         if drain_pending():
             # New messages arrived - discard tool call request, re-call API
             print(
-                f"[run_agent] Discarding tool call request due to pending messages",
+                "[run_agent] Discarding tool call request due to pending messages",
                 flush=True,
             )
             continue
 
         # No pending - safe to execute tools
         # Send intermediate text to user immediately (if present)
-        if msg.content:
+        if response_msg.content:
             chunks = (
-                [msg.content[i : i + 4096] for i in range(0, len(msg.content), 4096)]
-                if len(msg.content) > 4096
-                else [msg.content]
+                [
+                    response_msg.content[i : i + 4096]
+                    for i in range(0, len(response_msg.content), 4096)
+                ]
+                if len(response_msg.content) > 4096
+                else [response_msg.content]
             )
             for chunk in chunks:
                 try:
@@ -1779,41 +1648,36 @@ async def run_agent(
                 except TelegramError:
                     await _bot.send_message(chat_id=chat_id, text=chunk)
 
-        # Commit: append assistant message with tool calls (we're about to execute them)
-        assistant_msg = build_assistant_msg(msg)
-        messages.append(assistant_msg)
+        # Commit: append assistant message with tool calls
+        session.messages.append(response_msg)
 
         # Execute ALL tool calls in parallel - NOT interruptible
         # (tools may have side effects, API requires all tool_calls to have matching results)
-        async def run_tool(tc):
-            fn_name = tc.function.name
-            fn_args = json.loads(tc.function.arguments or "{}")
-            result = await execute_tool(fn_name, fn_args, chat_id)
-            return {"role": "tool", "tool_call_id": tc.id, "content": result}
+        async def run_tool(tc: ToolCall) -> ToolResult:
+            result = await execute_tool(tc.name, tc.arguments, chat_id)
+            return ToolResult(call_id=tc.call_id, content=result)
 
-        tool_results = await asyncio.gather(*[run_tool(tc) for tc in msg.tool_calls])
+        tool_results = await asyncio.gather(
+            *[run_tool(tc) for tc in response_msg.tool_calls]
+        )
 
-        # Append tool results and move cache_control to last result
-        if tool_results:
-            messages.extend(tool_results)
-            move_cache_control_to(len(messages) - 1)
+        # Append tool results as a single message
+        result_msg = Message(
+            role=MessageRole.TOOL_RESULT,
+            tool_results=list(tool_results),
+        )
+        session.messages.append(result_msg)
 
         # Loop continues - tool results now committed, will be sent to model
-        # (pending messages already drained before tool execution)
 
-    # Max iterations reached - save actual state
-    history_len = len(history)
-    for m in messages[history_len + 1 :]:
-        add_message_to_session(chat_id, m)
-
-    session_now = get_session(chat_id)
+    # Max iterations reached
     print(
-        f"[run_agent] Max iterations reached. Saved {len(session_now) - history_len} messages (total: {len(session_now)}, hash: {hash_messages(session_now)})",
+        f"[run_agent] Max iterations reached. Total messages: {len(session.messages)}",
         flush=True,
     )
 
     # Display-only warning (not saved to session)
-    last_content = get_content(response) if response else ""
+    last_content = response_msg.content if response_msg else ""
     if last_content:
         return f"{last_content}\n\n(iteration limit reached)"
     return "(iteration limit reached)"
@@ -2018,8 +1882,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Send typing indicator
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    get_session(chat_id)  # Ensure session exists
-    session = sessions[chat_id]
+    session = get_session(chat_id)
 
     # Inject time and user identity into the user message
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
@@ -2027,15 +1890,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     formatted_text = f"[{current_time}] [{user_name}] {text}"
 
     # If agent is running, queue message and return immediately (don't wait)
-    if session["lock"].locked():
-        session["pending_messages"].append(formatted_text)
+    if session.lock.locked():
+        session.pending_messages.append(formatted_text)
         print(
-            f"[handle_message] Queued message (pending={len(session['pending_messages'])})",
+            f"[handle_message] Queued message (pending={len(session.pending_messages)})",
             flush=True,
         )
         return
 
-    async with session["lock"]:
+    async with session.lock:
         response = await run_agent(
             formatted_text,
             chat_id,
@@ -2175,8 +2038,8 @@ async def scheduler_loop(app) -> None:
             # Check for expired sessions
             now_ts = time.time()
             expired_chats = []
-            for chat_id, session in list(sessions.items()):
-                if now_ts - session["last_used"] > SESSION_TIMEOUT:
+            for chat_id, session in list(get_all_sessions().items()):
+                if now_ts - session.last_used > SESSION_TIMEOUT:
                     expired_chats.append(chat_id)
 
             for chat_id in expired_chats:
@@ -2190,7 +2053,7 @@ async def scheduler_loop(app) -> None:
                         f"[scheduler] Failed to notify session timeout for {chat_id}: {e}",
                         flush=True,
                     )
-                sessions.pop(chat_id, None)
+                clear_session(chat_id)
 
         except Exception as e:
             print(f"[scheduler] Error in scheduler loop: {e}", flush=True)
@@ -2239,7 +2102,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     print(f"Bot starting... allowed users: {ALLOWED_USERS or 'all'}")
-    print(f"Model: {REASONING['model']}")
+    print(f"Model: {get_reasoning_adapter().model_name}")
     print(f"Session timeout: {SESSION_TIMEOUT // 3600}h")
     print(f"Scheduler interval: {SCHEDULER_INTERVAL}s")
     print(f"Attachments dir: {ATTACHMENTS_DIR}")
