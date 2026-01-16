@@ -17,9 +17,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 import litellm
 
-# Force httpx transport for SOCKS proxy support (aiohttp doesn't handle SOCKS properly)
-litellm.disable_aiohttp_transport = True
-
 from session import (
     Session,
     Message,
@@ -2061,16 +2058,30 @@ async def scheduler_loop(app) -> None:
         await asyncio.sleep(SCHEDULER_INTERVAL)
 
 
+_scheduler_task: asyncio.Task | None = None
+
+
 async def post_init(app) -> None:
     """Called after the application is initialized."""
-    global _bot
+    global _bot, _scheduler_task
     _bot = app.bot
     # Start the scheduler as a background task
-    asyncio.create_task(scheduler_loop(app))
+    _scheduler_task = asyncio.create_task(scheduler_loop(app))
 
 
 async def post_shutdown(app) -> None:
     """Called after the application is shut down - cleanup resources."""
+    global _scheduler_task
+
+    # Cancel the scheduler task
+    if _scheduler_task and not _scheduler_task.done():
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
+        print("[shutdown] Scheduler task cancelled", flush=True)
+
     # Close litellm's async HTTP clients to avoid the warning:
     # "RuntimeWarning: coroutine 'close_litellm_async_clients' was never awaited"
     try:
