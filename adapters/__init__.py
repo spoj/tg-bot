@@ -117,11 +117,14 @@ def get_gpt_adapter() -> GPTAdapter:
     """Get the GPT adapter (GPT-5.2 via OpenRouter).
 
     Not used by default in the main agent loop.
+
+    Note: uses `GPT_MODEL` (not `AGENT_MODEL`) so enabling GPT as the
+    reasoning model doesn't accidentally change this adapter too.
     """
     global _gpt_adapter
     if _gpt_adapter is None:
         _gpt_adapter = GPTAdapter(
-            model=os.environ.get("AGENT_MODEL", "openrouter/openai/gpt-5.2"),
+            model=os.environ.get("GPT_MODEL", "openrouter/openai/gpt-5.2"),
             max_tokens=16000,
             timeout=600,
         )

@@ -62,7 +62,9 @@ class GeminiAdapter:
         Returns:
             List of message dicts in OpenAI-compatible format.
         """
-        result: list[dict] = [{"role": "system", "content": system_prompt}]
+        result: list[dict] = []
+        if system_prompt:
+            result.append({"role": "system", "content": system_prompt})
 
         for msg in messages:
             rendered = self._render_message(msg)

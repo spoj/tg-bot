@@ -78,23 +78,22 @@ class AnthropicAdapter:
         Returns:
             List of message dicts in Anthropic/OpenAI format.
         """
-        result: list[dict] = [{"role": "system", "content": system_prompt}]
+        result: list[dict] = []
+        if system_prompt:
+            result.append({"role": "system", "content": system_prompt})
 
-        for i, msg in enumerate(messages):
+        for msg in messages:
             rendered = self._render_message(msg)
-            is_last = i == len(messages) - 1
-
             # Handle tool results which render as multiple messages
             if isinstance(rendered, list):
-                for j, r in enumerate(rendered):
-                    # Cache control on very last item of very last message
-                    if is_last and j == len(rendered) - 1:
-                        self._add_cache_control(r)
-                    result.append(r)
+                result.extend(rendered)
             else:
-                if is_last:
-                    self._add_cache_control(rendered)
                 result.append(rendered)
+
+        # Add cache_control to the last actual message we will send.
+        # This ensures the breakpoint is stable even if system_prompt is empty.
+        if result:
+            self._add_cache_control(result[-1])
 
         return result
 
