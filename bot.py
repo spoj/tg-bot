@@ -65,6 +65,17 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", Path.home() / "life"))
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 WAKEUPS_FILE = DATA_DIR / "wakeups.json"
 
+# Derived paths are functions so tests can patch DATA_DIR
+
+
+def get_stream_file() -> Path:
+    return DATA_DIR / "stream.txt"
+
+
+def get_stream_lock() -> Path:
+    return DATA_DIR / ".stream.txt.lock"
+
+
 # User identity mapping: user_id -> display name
 # Format in env: "123456:Matthew,789012:Daisy"
 # First user in ALLOWED_USERS is treated as owner
@@ -82,9 +93,11 @@ OWNER_NAME = USER_NAMES.get(OWNER_ID, "User") if OWNER_ID else "User"
 SESSION_TIMEOUT = 60 * 60  # 1 hour
 MAX_TOOL_ITERATIONS = 50
 
-# Stream config
-STREAM_FILE = DATA_DIR / "stream.txt"
-STREAM_LOCK = DATA_DIR / ".stream.txt.lock"
+# Stream config (derived from DATA_DIR)
+# (kept as constants for runtime use; tests may patch DATA_DIR, so stream tools
+# should prefer get_stream_file()/get_stream_lock())
+STREAM_FILE = get_stream_file()
+STREAM_LOCK = get_stream_lock()
 
 # Global bot reference for tools that need to send messages
 _bot = None
@@ -550,13 +563,20 @@ def get_mime_type(file_path: Path) -> str:
 
 # --- Stream tool implementations ---
 
+# Backwards-compat aliases (tests and older prompts)
+
+
+def tool_read_stream_tail(n: int = 50) -> str:
+    return tool_stream_tail(n)
+
 
 def _read_stream_lines() -> list[str]:
     """Read stream.txt and return lines. Auto-creates if doesn't exist."""
-    if not STREAM_FILE.exists():
+    stream_file = get_stream_file()
+    if not stream_file.exists():
         today = datetime.now().strftime("%Y-%m-%d")
-        STREAM_FILE.write_text(f"# {today}\n")
-    return STREAM_FILE.read_text().splitlines()
+        stream_file.write_text(f"# {today}\n")
+    return stream_file.read_text().splitlines()
 
 
 def _format_lines(lines: list[str], start_line: int, total: int) -> str:
@@ -620,11 +640,14 @@ def tool_stream_append(text: str) -> str:
     if not text:
         return "Error: text cannot be empty."
 
-    with open(STREAM_LOCK, "w") as lock:
+    stream_file = get_stream_file()
+    stream_lock = get_stream_lock()
+
+    with open(stream_lock, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            if STREAM_FILE.exists():
-                content = STREAM_FILE.read_text()
+            if stream_file.exists():
+                content = stream_file.read_text()
             else:
                 today = datetime.now().strftime("%Y-%m-%d")
                 content = f"# {today}\n"
@@ -634,7 +657,7 @@ def tool_stream_append(text: str) -> str:
             if not text.startswith("\n"):
                 content += "\n"
             content += text.rstrip("\n") + "\n"  # Ensure exactly one trailing newline
-            STREAM_FILE.write_text(content)
+            stream_file.write_text(content)
 
             # Return context: last n+5 lines where n is lines added
             lines = content.splitlines()
@@ -653,8 +676,11 @@ def tool_stream_append(text: str) -> str:
 
 
 def tool_stream_replace(from_text: str, to_text: str) -> str:
-    """Replace text in the last 50 lines of stream.txt. Must match complete lines."""
-    if not STREAM_FILE.exists():
+    """Replace text in the last 100 lines of stream.txt. Must match complete lines."""
+    stream_file = get_stream_file()
+    stream_lock = get_stream_lock()
+
+    if not stream_file.exists():
         return "Error: stream.txt does not exist."
 
     # Validate from_text - must be non-empty
@@ -662,15 +688,14 @@ def tool_stream_replace(from_text: str, to_text: str) -> str:
     if not from_text_stripped:
         return "Error: from_text cannot be empty."
 
-    with open(STREAM_LOCK, "w") as lock:
+    with open(stream_lock, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            content = STREAM_FILE.read_text()
+            content = stream_file.read_text()
             lines = content.split("\n")
-            total_before = len(lines)
 
-            # Get last 50 lines window
-            window_size = 50
+            # Get last 100 lines window
+            window_size = 100
             window_start = max(0, len(lines) - window_size)
             window_lines = lines[window_start:]
 
@@ -685,7 +710,7 @@ def tool_stream_replace(from_text: str, to_text: str) -> str:
                     match_indices.append(i)
 
             if len(match_indices) == 0:
-                return f"Error: from_text not found as complete line(s) in last {window_size} lines."
+                return f"Error: from_text not found in last {window_size} lines."
             if len(match_indices) > 1:
                 return f"Error: from_text found {len(match_indices)} times in last {window_size} lines - be more specific."
 
@@ -701,7 +726,7 @@ def tool_stream_replace(from_text: str, to_text: str) -> str:
             new_lines = lines[:window_start] + new_window_lines
             new_content = "\n".join(new_lines)
 
-            STREAM_FILE.write_text(new_content)
+            stream_file.write_text(new_content)
 
             # Calculate context window: 5 lines before and after the change
             total_after = len(new_lines)
@@ -1326,6 +1351,7 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     # Sync tools - dispatch table
     dispatch = {
         "stream_tail": (tool_stream_tail, lambda a, c: (a.get("n", 50),)),
+        "read_stream_tail": (tool_read_stream_tail, lambda a, c: (a.get("n", 50),)),
         "stream_range": (
             tool_stream_range,
             lambda a, c: (a["from_line"], a["to_line"]),
