@@ -192,7 +192,20 @@ class GPTAdapter:
         if not usage:
             return {}
 
-        return {
+        result: dict[str, Any] = {
             "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
             "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
         }
+
+        # Best-effort cached token extraction (LiteLLM/OpenAI-style)
+        # Some providers expose this as usage.prompt_tokens_details.cached_tokens.
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            result["cache_read"] = getattr(details, "cached_tokens", 0) or 0
+            result["cache_write"] = getattr(details, "cache_write_tokens", 0) or 0
+
+        # Fallback: sometimes cached token count is on the usage object.
+        if "cache_read" not in result:
+            result["cache_read"] = getattr(usage, "cached_tokens", 0) or 0
+
+        return result
