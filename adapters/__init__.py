@@ -59,8 +59,8 @@ def get_reasoning_adapter() -> ModelAdapter:
         else:
             _reasoning_adapter = AnthropicAdapter(
                 model=model,
-                reasoning={"max_tokens": 30000},
-                max_tokens=32000,
+                reasoning={"effort": "high"},
+                max_tokens=64000,
                 timeout=600,
                 provider_order=["anthropic"],
             )
