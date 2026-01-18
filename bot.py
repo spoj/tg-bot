@@ -1442,9 +1442,21 @@ async def preprocess_audio(file_path: str) -> str | None:
             attachments=[attachment],
         )
 
+        # Load session brief for context (names, jargon, terminology)
+        system_prompt = ""
+        try:
+            session_brief = tool_session_brief()
+            system_prompt = f"Context about the speaker (use for recognizing names, jargon, terminology):\n\n{session_brief}"
+            print(
+                f"[preprocess_audio] Loaded session brief context ({len(session_brief)} chars)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[preprocess_audio] Failed to load session brief: {e}", flush=True)
+
         adapter = get_vision_adapter()
         response, _ = await adapter.complete(
-            system_prompt="",
+            system_prompt=system_prompt,
             messages=[msg],
         )
         result = response.content
