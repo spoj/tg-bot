@@ -1425,6 +1425,7 @@ async def tool_browser_task(task: str, session_id: str | None = None) -> str:
             result = await client.agents.hyper_agent.start_and_wait(
                 StartHyperAgentTaskParams(
                     task=task,
+                    version="1.1.0",
                     llm="gemini-3-flash-preview",
                     max_steps=30,
                     session_id=session_id,
