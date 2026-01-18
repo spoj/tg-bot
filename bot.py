@@ -2,7 +2,6 @@
 """Telegram bot with custom Opus agent loop for quick queries and logging."""
 
 import asyncio
-import aiohttp
 import base64
 import fcntl
 import hashlib
@@ -1360,49 +1359,38 @@ async def tool_browser_session(chat_id: int) -> str:
     Returns session_id to agent, sends live URL to user.
     Session lasts 10 minutes.
     """
+    from hyperbrowser import AsyncHyperbrowser
+    from hyperbrowser.models import CreateSessionParams, ScreenConfig
+
     api_key = os.environ.get("HYPERBROWSER_API_KEY")
     if not api_key:
         return "Error: HYPERBROWSER_API_KEY not set."
 
-    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
-    base_url = "https://api.hyperbrowser.ai/api"
-
     try:
-        async with aiohttp.ClientSession() as http_session:
+        async with AsyncHyperbrowser(api_key=api_key) as client:
             print("[browser_session] Creating persistent session...", flush=True)
-            async with http_session.post(
-                f"{base_url}/session",
-                headers=headers,
-                json={
-                    "screen": {"width": 1280, "height": 720},
-                    "timeoutMinutes": 10,
-                },
-            ) as resp:
-                data = await resp.json()
-                if resp.status != 200:
-                    return f"Error creating session: {data}"
-                session_id = data.get("id")
-                live_url = data.get("liveUrl")
-                print(f"[browser_session] Session created: {session_id}", flush=True)
+            session = await client.sessions.create(
+                CreateSessionParams(
+                    screen=ScreenConfig(width=1280, height=720),
+                    timeout_minutes=10,
+                )
+            )
+            session_id = session.id
+            live_url = session.live_url
+            print(f"[browser_session] Session created: {session_id}", flush=True)
 
-                # Send live URL to user
-                if _bot and live_url:
-                    try:
-                        await _bot.send_message(
-                            chat_id=chat_id,
-                            text=f"Browser session for manual login (10 min): {live_url}",
-                        )
-                    except Exception as e:
-                        print(
-                            f"[browser_session] Failed to send live URL: {e}",
-                            flush=True,
-                        )
+            # Send live URL to user
+            if _bot and live_url:
+                try:
+                    await _bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Browser session for manual login (10 min): {live_url}",
+                    )
+                except Exception as e:
+                    print(f"[browser_session] Failed to send live URL: {e}", flush=True)
 
-                return f"Session created: {session_id}\nUser has been sent the live URL for manual login. Ask user to confirm when login is complete, then use browser_task with this session_id."
+            return f"Session created: {session_id}\nUser has been sent the live URL for manual login. Ask user to confirm when login is complete, then use browser_task with this session_id."
 
-    except aiohttp.ClientError as e:
-        print(f"[browser_session] Network error: {e}", flush=True)
-        return f"Network error: {e}"
     except Exception as e:
         print(f"[browser_session] Error: {e}", flush=True)
         return f"Error: {e}"
@@ -1414,78 +1402,45 @@ async def tool_browser_task(task: str, session_id: str | None = None) -> str:
     If session_id is None, runs in ephemeral session (API-managed, ends with task).
     If session_id is provided, runs on that persistent session.
     """
+    from hyperbrowser import AsyncHyperbrowser
+    from hyperbrowser.models import StartHyperAgentTaskParams
+
     api_key = os.environ.get("HYPERBROWSER_API_KEY")
     if not api_key:
         return "Error: HYPERBROWSER_API_KEY not set. For read-only web content, use web_search instead."
 
-    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
-    base_url = "https://api.hyperbrowser.ai/api"
-
     try:
-        async with aiohttp.ClientSession() as http_session:
-            # Build request payload
-            payload = {
-                "task": task,
-                "version": "1.1.0",
-                "llm": "gemini-3-flash-preview",
-                "maxSteps": 30,
-            }
+        async with AsyncHyperbrowser(api_key=api_key) as client:
             if session_id:
-                # Use existing persistent session
-                payload["sessionId"] = session_id
-                payload["keepBrowserOpen"] = True
                 print(
                     f"[browser_task] Running on session {session_id}: {task[:100]}...",
                     flush=True,
                 )
             else:
-                # Ephemeral session - API creates and destroys it
                 print(
                     f"[browser_task] Running ephemeral task: {task[:100]}...",
                     flush=True,
                 )
 
-            # Start HyperAgent task
-            async with http_session.post(
-                f"{base_url}/task/hyper-agent",
-                headers=headers,
-                json=payload,
-            ) as resp:
-                job_data = await resp.json()
-                if resp.status != 200:
-                    return f"Error starting task: {job_data}"
-                job_id = job_data.get("jobId")
-                print(f"[browser_task] Job started: {job_id}", flush=True)
-
-            # Poll for completion
-            while True:
-                await asyncio.sleep(3)
-                async with http_session.get(
-                    f"{base_url}/task/hyper-agent/{job_id}",
-                    headers=headers,
-                ) as resp:
-                    result = await resp.json()
-
-                status = result.get("status")
-                print(f"[browser_task] Status: {status}", flush=True)
-                if status in ("completed", "failed", "stopped"):
-                    break
-
-            # Format result
-            if status == "completed":
-                final_result = result.get("data", {}).get(
-                    "finalResult", "No result returned"
+            result = await client.agents.hyper_agent.start_and_wait(
+                StartHyperAgentTaskParams(
+                    task=task,
+                    llm="gemini-3-flash-preview",
+                    max_steps=30,
+                    session_id=session_id,
+                    keep_browser_open=bool(session_id),
                 )
+            )
+
+            print(f"[browser_task] Status: {result.status}", flush=True)
+
+            if result.status == "completed" and result.data:
+                final_result = result.data.final_result or "No result returned"
                 return f"Task completed.\n\nResult:\n{final_result}"
             else:
-                error = result.get(
-                    "error", result.get("data", {}).get("error", "Unknown error")
-                )
-                return f"Task {status}.\n\nError: {error}"
+                error = result.error or "Unknown error"
+                return f"Task {result.status}.\n\nError: {error}"
 
-    except aiohttp.ClientError as e:
-        print(f"[browser_task] Network error: {e}", flush=True)
-        return f"Network error: {e}"
     except Exception as e:
         print(f"[browser_task] Error: {e}", flush=True)
         return f"Error: {e}"

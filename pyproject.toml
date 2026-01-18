@@ -16,6 +16,7 @@ dependencies = [
     "httpx-socks>=0.11.0",
     "pysocks>=1.7.1",
     "e2b>=1.0.0",
+    "hyperbrowser>=0.82.0",
 ]
 
 [project.scripts]
