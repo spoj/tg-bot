@@ -1961,9 +1961,10 @@ async def process_wakeup(wakeup: dict, bot) -> None:
     print(f"[scheduler] Processing wakeup {wakeup_id}: {prompt[:50]}...", flush=True)
 
     try:
-        # Run agent with the wakeup prompt
+        # Run agent with the wakeup prompt (include current datetime for context)
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         response = await run_agent(
-            f"[SCHEDULED WAKEUP] {prompt}",
+            f"[{current_time}] [SCHEDULED WAKEUP] {prompt}",
             chat_id,
         )
 
