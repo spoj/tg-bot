@@ -104,10 +104,8 @@ STREAM_LOCK = get_stream_lock()
 _bot = None
 
 # Global browser session state (Hyperbrowser)
+# Session auto-expires after 5 mins inactivity (server-side)
 _browser_session_id: str | None = None
-_browser_session_live_url: str | None = None
-_browser_session_last_used: float = 0.0  # timestamp of last use
-BROWSER_SESSION_IDLE_TIMEOUT = 5 * 60  # 5 minutes inactivity timeout
 
 
 # Tool definitions for Opus
@@ -1346,8 +1344,11 @@ async def tool_e2b_download(path: str, chat_id: int) -> str:
 
 
 async def tool_browser_task(task: str) -> str:
-    """Run a browser automation task using HyperAgent."""
-    global _browser_session_id, _browser_session_live_url, _browser_session_last_used
+    """Run a browser automation task using HyperAgent.
+
+    Session auto-expires after 5 mins of inactivity (server-side).
+    """
+    global _browser_session_id
 
     api_key = os.environ.get("HYPERBROWSER_API_KEY")
     if not api_key:
@@ -1358,34 +1359,21 @@ async def tool_browser_task(task: str) -> str:
 
     try:
         async with aiohttp.ClientSession() as http_session:
-            # Check if existing session has expired due to inactivity
-            if (
-                _browser_session_id
-                and (time.time() - _browser_session_last_used)
-                > BROWSER_SESSION_IDLE_TIMEOUT
-            ):
-                print("[browser_task] Session idle timeout, clearing...", flush=True)
-                _browser_session_id = None
-                _browser_session_live_url = None
-
             # 1. Start session if needed
             if not _browser_session_id:
                 print("[browser_task] Creating new browser session...", flush=True)
-                async with (
-                    http_session.post(
-                        f"{base_url}/session",
-                        headers=headers,
-                        json={
-                            "screen": {"width": 1280, "height": 720},
-                            "timeoutMinutes": 10,  # Server-side max, we enforce 5 min idle locally
-                        },
-                    ) as resp
-                ):
+                async with http_session.post(
+                    f"{base_url}/session",
+                    headers=headers,
+                    json={
+                        "screen": {"width": 1280, "height": 720},
+                        "timeoutMinutes": 5,  # 5 min inactivity timeout (server-side)
+                    },
+                ) as resp:
                     data = await resp.json()
                     if resp.status != 200:
                         return f"Error creating session: {data}"
                     _browser_session_id = data.get("id")
-                    _browser_session_live_url = data.get("liveUrl")
                     print(
                         f"[browser_task] Session created: {_browser_session_id}",
                         flush=True,
@@ -1411,7 +1399,6 @@ async def tool_browser_task(task: str) -> str:
                     if "session" in str(job_data).lower():
                         print("[browser_task] Session expired, clearing...", flush=True)
                         _browser_session_id = None
-                        _browser_session_live_url = None
                         return await tool_browser_task(task)  # Retry with new session
                     return f"Error starting task: {job_data}"
                 job_id = job_data.get("jobId")
@@ -1432,19 +1419,16 @@ async def tool_browser_task(task: str) -> str:
                     break
 
             # 4. Format result
-            # Update last-used timestamp for idle timeout tracking
-            _browser_session_last_used = time.time()
-
             if status == "completed":
                 final_result = result.get("data", {}).get(
                     "finalResult", "No result returned"
                 )
-                return f"Task completed.\nLive URL: {_browser_session_live_url}\n\nResult:\n{final_result}"
+                return f"Task completed.\n\nResult:\n{final_result}"
             else:
                 error = result.get(
                     "error", result.get("data", {}).get("error", "Unknown error")
                 )
-                return f"Task {status}: {error}\nLive URL: {_browser_session_live_url}"
+                return f"Task {status}: {error}"
 
     except aiohttp.ClientError as e:
         print(f"[browser_task] Network error: {e}", flush=True)
