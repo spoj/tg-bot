@@ -1343,10 +1343,11 @@ async def tool_e2b_download(path: str, chat_id: int) -> str:
         return f"Error downloading file: {e}"
 
 
-async def tool_browser_task(task: str) -> str:
+async def tool_browser_task(task: str, chat_id: int) -> str:
     """Run a browser automation task using HyperAgent.
 
     Session auto-expires after 5 mins of inactivity (server-side).
+    Live URL is sent directly to user (not returned to agent).
     """
     global _browser_session_id
 
@@ -1374,10 +1375,23 @@ async def tool_browser_task(task: str) -> str:
                     if resp.status != 200:
                         return f"Error creating session: {data}"
                     _browser_session_id = data.get("id")
+                    live_url = data.get("liveUrl")
                     print(
                         f"[browser_task] Session created: {_browser_session_id}",
                         flush=True,
                     )
+                    # Send live URL directly to user (not to agent)
+                    if _bot and live_url:
+                        try:
+                            await _bot.send_message(
+                                chat_id=chat_id,
+                                text=f"Browser session started: {live_url}",
+                            )
+                        except Exception as e:
+                            print(
+                                f"[browser_task] Failed to send live URL: {e}",
+                                flush=True,
+                            )
 
             # 2. Run HyperAgent task
             print(f"[browser_task] Running task: {task[:100]}...", flush=True)
@@ -1399,7 +1413,9 @@ async def tool_browser_task(task: str) -> str:
                     if "session" in str(job_data).lower():
                         print("[browser_task] Session expired, clearing...", flush=True)
                         _browser_session_id = None
-                        return await tool_browser_task(task)  # Retry with new session
+                        return await tool_browser_task(
+                            task, chat_id
+                        )  # Retry with new session
                     return f"Error starting task: {job_data}"
                 job_id = job_data.get("jobId")
                 print(f"[browser_task] Job started: {job_id}", flush=True)
@@ -1418,17 +1434,17 @@ async def tool_browser_task(task: str) -> str:
                 if status in ("completed", "failed", "stopped"):
                     break
 
-            # 4. Format result
+            # 4. Format result (user has live URL if they need to intervene)
             if status == "completed":
                 final_result = result.get("data", {}).get(
                     "finalResult", "No result returned"
                 )
-                return f"Task completed.\n\nResult:\n{final_result}"
+                return f"Task completed. (User has live URL if manual login needed)\n\nResult:\n{final_result}"
             else:
                 error = result.get(
                     "error", result.get("data", {}).get("error", "Unknown error")
                 )
-                return f"Task {status}: {error}"
+                return f"Task {status}. (User has live URL if manual login needed)\n\nError: {error}"
 
     except aiohttp.ClientError as e:
         print(f"[browser_task] Network error: {e}", flush=True)
@@ -1455,7 +1471,7 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         )
     # Browser automation
     if name == "browser_task":
-        return await tool_browser_task(args["task"])
+        return await tool_browser_task(args["task"], chat_id)
     # E2B sandbox tools
     if name == "e2b_upload":
         return await tool_e2b_upload(args["attachment_id"], chat_id)
