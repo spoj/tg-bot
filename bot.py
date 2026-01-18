@@ -1426,7 +1426,7 @@ async def tool_browser_task(task: str, session_id: str | None = None) -> str:
                 StartHyperAgentTaskParams(
                     task=task,
                     version="1.1.0",
-                    llm="gemini-3-flash-preview",
+                    llm="claude-sonnet-4-5",
                     max_steps=30,
                     session_id=session_id,
                     keep_browser_open=bool(session_id),
