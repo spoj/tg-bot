@@ -2,6 +2,7 @@
 """Telegram bot with custom Opus agent loop for quick queries and logging."""
 
 import asyncio
+import aiohttp
 import base64
 import fcntl
 import hashlib
@@ -101,6 +102,10 @@ STREAM_LOCK = get_stream_lock()
 
 # Global bot reference for tools that need to send messages
 _bot = None
+
+# Global browser session state (Hyperbrowser)
+_browser_session_id: str | None = None
+_browser_session_live_url: str | None = None
 
 
 # Tool definitions for Opus
@@ -440,6 +445,23 @@ TOOLS = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_task",
+            "description": "Run a browser automation task using HyperAgent. Auto-creates a cloud browser session if needed (5 min timeout). Use for web tasks requiring interaction: filling forms, clicking buttons, navigation, extracting data from JS-heavy sites. Returns live URL to watch the browser.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Natural language description of what to do in the browser",
+                    },
+                },
+                "required": ["task"],
             },
         },
     },
@@ -1321,6 +1343,100 @@ async def tool_e2b_download(path: str, chat_id: int) -> str:
         return f"Error downloading file: {e}"
 
 
+async def tool_browser_task(task: str) -> str:
+    """Run a browser automation task using HyperAgent."""
+    global _browser_session_id, _browser_session_live_url
+
+    api_key = os.environ.get("HYPERBROWSER_API_KEY")
+    if not api_key:
+        return "Error: HYPERBROWSER_API_KEY not set. For read-only web content, use web_search instead."
+
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    base_url = "https://api.hyperbrowser.ai/api"
+
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            # 1. Start session if needed
+            if not _browser_session_id:
+                print("[browser_task] Creating new browser session...", flush=True)
+                async with http_session.post(
+                    f"{base_url}/session",
+                    headers=headers,
+                    json={
+                        "screen": {"width": 1280, "height": 720},
+                        "timeoutMinutes": 5,
+                    },
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status != 200:
+                        return f"Error creating session: {data}"
+                    _browser_session_id = data.get("id")
+                    _browser_session_live_url = data.get("liveUrl")
+                    print(
+                        f"[browser_task] Session created: {_browser_session_id}",
+                        flush=True,
+                    )
+
+            # 2. Run HyperAgent task
+            print(f"[browser_task] Running task: {task[:100]}...", flush=True)
+            async with http_session.post(
+                f"{base_url}/task/hyper-agent",
+                headers=headers,
+                json={
+                    "task": task,
+                    "version": "1.1.0",
+                    "llm": "gemini-3-flash-preview",
+                    "maxSteps": 30,
+                    "sessionId": _browser_session_id,
+                    "keepBrowserOpen": True,
+                },
+            ) as resp:
+                job_data = await resp.json()
+                if resp.status != 200:
+                    # Session may have expired, clear and retry once
+                    if "session" in str(job_data).lower():
+                        print("[browser_task] Session expired, clearing...", flush=True)
+                        _browser_session_id = None
+                        _browser_session_live_url = None
+                        return await tool_browser_task(task)  # Retry with new session
+                    return f"Error starting task: {job_data}"
+                job_id = job_data.get("jobId")
+                print(f"[browser_task] Job started: {job_id}", flush=True)
+
+            # 3. Poll for completion
+            while True:
+                await asyncio.sleep(3)
+                async with http_session.get(
+                    f"{base_url}/task/hyper-agent/{job_id}",
+                    headers=headers,
+                ) as resp:
+                    result = await resp.json()
+
+                status = result.get("status")
+                print(f"[browser_task] Status: {status}", flush=True)
+                if status in ("completed", "failed", "stopped"):
+                    break
+
+            # 4. Format result
+            if status == "completed":
+                final_result = result.get("data", {}).get(
+                    "finalResult", "No result returned"
+                )
+                return f"Task completed.\nLive URL: {_browser_session_live_url}\n\nResult:\n{final_result}"
+            else:
+                error = result.get(
+                    "error", result.get("data", {}).get("error", "Unknown error")
+                )
+                return f"Task {status}: {error}\nLive URL: {_browser_session_live_url}"
+
+    except aiohttp.ClientError as e:
+        print(f"[browser_task] Network error: {e}", flush=True)
+        return f"Network error: {e}"
+    except Exception as e:
+        print(f"[browser_task] Error: {e}", flush=True)
+        return f"Error: {e}"
+
+
 async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     """Execute a tool and return result."""
     # Async tools
@@ -1336,6 +1452,9 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_send_attachment(
             args["attachment_id"], chat_id, args.get("caption")
         )
+    # Browser automation
+    if name == "browser_task":
+        return await tool_browser_task(args["task"])
     # E2B sandbox tools
     if name == "e2b_upload":
         return await tool_e2b_upload(args["attachment_id"], chat_id)
