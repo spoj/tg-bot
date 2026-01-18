@@ -447,7 +447,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "browser_task",
-            "description": "Run a browser automation task using HyperAgent. By default runs in ephemeral session (no state). If session_id provided, runs on that persistent session (e.g., after user logged in manually).",
+            "description": "Run a browser automation task using HyperAgent. Without session_id: runs in ephemeral session that is created and destroyed with the task (no login state, no timeout concerns). With session_id: runs on persistent session (from browser_session) that preserves login state.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -457,7 +457,7 @@ TOOLS = [
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Optional: ID of persistent session (from browser_session) to run on. If omitted, runs in fresh ephemeral session.",
+                        "description": "Optional: ID of persistent session (from browser_session). If omitted, runs in fresh ephemeral session.",
                     },
                 },
                 "required": ["task"],
@@ -468,7 +468,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "browser_session",
-            "description": "Create a persistent browser session for manual user login. User receives live URL to login manually. Returns session_id to use with browser_task. Use when a task requires authentication that can't be automated.",
+            "description": "Create a persistent browser session (10 min timeout) for manual user login. User receives live URL via Telegram to login manually. Returns session_id to pass to browser_task. Use only when task requires authentication that can't be automated - ask user to confirm when login is complete.",
             "parameters": {
                 "type": "object",
                 "properties": {},
