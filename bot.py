@@ -103,11 +103,6 @@ STREAM_LOCK = get_stream_lock()
 # Global bot reference for tools that need to send messages
 _bot = None
 
-# Global browser session state (Hyperbrowser)
-# Session auto-expires after 5 mins inactivity (server-side)
-_browser_session_id: str | None = None
-
-
 # Tool definitions for Opus
 TOOLS = [
     {
@@ -452,7 +447,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "browser_task",
-            "description": "Run a browser automation task using HyperAgent. Auto-creates a cloud browser session if needed (5 min timeout). Use for web tasks requiring interaction: filling forms, clicking buttons, navigation, extracting data from JS-heavy sites. Returns live URL to watch the browser.",
+            "description": "Run a browser automation task using HyperAgent. By default runs in ephemeral session (no state). If session_id provided, runs on that persistent session (e.g., after user logged in manually).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -460,8 +455,24 @@ TOOLS = [
                         "type": "string",
                         "description": "Natural language description of what to do in the browser",
                     },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: ID of persistent session (from browser_session) to run on. If omitted, runs in fresh ephemeral session.",
+                    },
                 },
                 "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_session",
+            "description": "Create a persistent browser session for manual user login. User receives live URL to login manually. Returns session_id to use with browser_task. Use when a task requires authentication that can't be automated.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         },
     },
@@ -1343,14 +1354,66 @@ async def tool_e2b_download(path: str, chat_id: int) -> str:
         return f"Error downloading file: {e}"
 
 
-async def tool_browser_task(task: str, chat_id: int) -> str:
+async def tool_browser_session(chat_id: int) -> str:
+    """Create a persistent browser session for manual user login.
+
+    Returns session_id to agent, sends live URL to user.
+    Session lasts 10 minutes.
+    """
+    api_key = os.environ.get("HYPERBROWSER_API_KEY")
+    if not api_key:
+        return "Error: HYPERBROWSER_API_KEY not set."
+
+    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    base_url = "https://api.hyperbrowser.ai/api"
+
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            print("[browser_session] Creating persistent session...", flush=True)
+            async with http_session.post(
+                f"{base_url}/session",
+                headers=headers,
+                json={
+                    "screen": {"width": 1280, "height": 720},
+                    "timeoutMinutes": 10,
+                },
+            ) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    return f"Error creating session: {data}"
+                session_id = data.get("id")
+                live_url = data.get("liveUrl")
+                print(f"[browser_session] Session created: {session_id}", flush=True)
+
+                # Send live URL to user
+                if _bot and live_url:
+                    try:
+                        await _bot.send_message(
+                            chat_id=chat_id,
+                            text=f"Browser session for manual login (10 min): {live_url}",
+                        )
+                    except Exception as e:
+                        print(
+                            f"[browser_session] Failed to send live URL: {e}",
+                            flush=True,
+                        )
+
+                return f"Session created: {session_id}\nUser has been sent the live URL for manual login. Ask user to confirm when login is complete, then use browser_task with this session_id."
+
+    except aiohttp.ClientError as e:
+        print(f"[browser_session] Network error: {e}", flush=True)
+        return f"Network error: {e}"
+    except Exception as e:
+        print(f"[browser_session] Error: {e}", flush=True)
+        return f"Error: {e}"
+
+
+async def tool_browser_task(task: str, session_id: str | None = None) -> str:
     """Run a browser automation task using HyperAgent.
 
-    Session auto-expires after 5 mins of inactivity (server-side).
-    Live URL is sent directly to user (not returned to agent).
+    If session_id is None, runs in ephemeral session (API-managed, ends with task).
+    If session_id is provided, runs on that persistent session.
     """
-    global _browser_session_id
-
     api_key = os.environ.get("HYPERBROWSER_API_KEY")
     if not api_key:
         return "Error: HYPERBROWSER_API_KEY not set. For read-only web content, use web_search instead."
@@ -1360,69 +1423,41 @@ async def tool_browser_task(task: str, chat_id: int) -> str:
 
     try:
         async with aiohttp.ClientSession() as http_session:
-            # 1. Start session if needed
-            new_session = False
-            if not _browser_session_id:
-                new_session = True
-                print("[browser_task] Creating new browser session...", flush=True)
-                async with http_session.post(
-                    f"{base_url}/session",
-                    headers=headers,
-                    json={
-                        "screen": {"width": 1280, "height": 720},
-                        "timeoutMinutes": 5,  # 5 min inactivity timeout (server-side)
-                    },
-                ) as resp:
-                    data = await resp.json()
-                    if resp.status != 200:
-                        return f"Error creating session: {data}"
-                    _browser_session_id = data.get("id")
-                    live_url = data.get("liveUrl")
-                    print(
-                        f"[browser_task] Session created: {_browser_session_id}",
-                        flush=True,
-                    )
-                    # Send live URL directly to user (not to agent)
-                    if _bot and live_url:
-                        try:
-                            await _bot.send_message(
-                                chat_id=chat_id,
-                                text=f"Browser session started: {live_url}",
-                            )
-                        except Exception as e:
-                            print(
-                                f"[browser_task] Failed to send live URL: {e}",
-                                flush=True,
-                            )
+            # Build request payload
+            payload = {
+                "task": task,
+                "version": "1.1.0",
+                "llm": "gemini-3-flash-preview",
+                "maxSteps": 30,
+            }
+            if session_id:
+                # Use existing persistent session
+                payload["sessionId"] = session_id
+                payload["keepBrowserOpen"] = True
+                print(
+                    f"[browser_task] Running on session {session_id}: {task[:100]}...",
+                    flush=True,
+                )
+            else:
+                # Ephemeral session - API creates and destroys it
+                print(
+                    f"[browser_task] Running ephemeral task: {task[:100]}...",
+                    flush=True,
+                )
 
-            # 2. Run HyperAgent task
-            print(f"[browser_task] Running task: {task[:100]}...", flush=True)
+            # Start HyperAgent task
             async with http_session.post(
                 f"{base_url}/task/hyper-agent",
                 headers=headers,
-                json={
-                    "task": task,
-                    "version": "1.1.0",
-                    "llm": "gemini-3-flash-preview",
-                    "maxSteps": 30,
-                    "sessionId": _browser_session_id,
-                    "keepBrowserOpen": True,
-                },
+                json=payload,
             ) as resp:
                 job_data = await resp.json()
                 if resp.status != 200:
-                    # Session may have expired, clear and retry once
-                    if "session" in str(job_data).lower():
-                        print("[browser_task] Session expired, clearing...", flush=True)
-                        _browser_session_id = None
-                        return await tool_browser_task(
-                            task, chat_id
-                        )  # Retry with new session
                     return f"Error starting task: {job_data}"
                 job_id = job_data.get("jobId")
                 print(f"[browser_task] Job started: {job_id}", flush=True)
 
-            # 3. Poll for completion
+            # Poll for completion
             while True:
                 await asyncio.sleep(3)
                 async with http_session.get(
@@ -1436,22 +1471,17 @@ async def tool_browser_task(task: str, chat_id: int) -> str:
                 if status in ("completed", "failed", "stopped"):
                     break
 
-            # 4. Format result
-            session_note = (
-                " (New session - user was sent live URL for manual intervention if needed)"
-                if new_session
-                else ""
-            )
+            # Format result
             if status == "completed":
                 final_result = result.get("data", {}).get(
                     "finalResult", "No result returned"
                 )
-                return f"Task completed.{session_note}\n\nResult:\n{final_result}"
+                return f"Task completed.\n\nResult:\n{final_result}"
             else:
                 error = result.get(
                     "error", result.get("data", {}).get("error", "Unknown error")
                 )
-                return f"Task {status}.{session_note}\n\nError: {error}"
+                return f"Task {status}.\n\nError: {error}"
 
     except aiohttp.ClientError as e:
         print(f"[browser_task] Network error: {e}", flush=True)
@@ -1477,8 +1507,10 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
             args["attachment_id"], chat_id, args.get("caption")
         )
     # Browser automation
+    if name == "browser_session":
+        return await tool_browser_session(chat_id)
     if name == "browser_task":
-        return await tool_browser_task(args["task"], chat_id)
+        return await tool_browser_task(args["task"], args.get("session_id"))
     # E2B sandbox tools
     if name == "e2b_upload":
         return await tool_e2b_upload(args["attachment_id"], chat_id)
