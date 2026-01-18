@@ -1361,7 +1361,9 @@ async def tool_browser_task(task: str, chat_id: int) -> str:
     try:
         async with aiohttp.ClientSession() as http_session:
             # 1. Start session if needed
+            new_session = False
             if not _browser_session_id:
+                new_session = True
                 print("[browser_task] Creating new browser session...", flush=True)
                 async with http_session.post(
                     f"{base_url}/session",
@@ -1434,17 +1436,22 @@ async def tool_browser_task(task: str, chat_id: int) -> str:
                 if status in ("completed", "failed", "stopped"):
                     break
 
-            # 4. Format result (user has live URL if they need to intervene)
+            # 4. Format result
+            session_note = (
+                " (New session - user was sent live URL for manual intervention if needed)"
+                if new_session
+                else ""
+            )
             if status == "completed":
                 final_result = result.get("data", {}).get(
                     "finalResult", "No result returned"
                 )
-                return f"Task completed. (User has live URL if manual login needed)\n\nResult:\n{final_result}"
+                return f"Task completed.{session_note}\n\nResult:\n{final_result}"
             else:
                 error = result.get(
                     "error", result.get("data", {}).get("error", "Unknown error")
                 )
-                return f"Task {status}. (User has live URL if manual login needed)\n\nError: {error}"
+                return f"Task {status}.{session_note}\n\nError: {error}"
 
     except aiohttp.ClientError as e:
         print(f"[browser_task] Network error: {e}", flush=True)
