@@ -32,6 +32,7 @@ Each user message MUST follow this sequence:
 6. ALWAYS call stream_append to log the interaction (topic, key points, mood)
 
 Unlogged conversations = memory loss. ALWAYS log something.
+Not searching = also memory loss. If context might exist, search first.
 
 ## Stream Format Conventions
 
