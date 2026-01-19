@@ -212,6 +212,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "stream_find",
+            "description": "Find relevant sections in stream.txt. Returns (date, line_range, reason) tuples. Use this first to identify relevant sections, then stream_range to read specific ones. More efficient than ask_stream when you need the actual content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for in the stream history",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "session_brief",
             "description": "Get a comprehensive session brief including: tail 50 lines, timeline, and AI-generated summary of urgent items, calendar events, active todos, upcoming events, and retrieval aids. Use at start of sessions or when user asks for a briefing.",
             "parameters": {
@@ -842,6 +859,50 @@ Question: {query}"""
         return f"Ask stream error: {e}"
 
 
+async def tool_stream_find(query: str) -> str:
+    """Find relevant sections in stream.txt, returning (date, line_range, reason) tuples."""
+    lines = _read_stream_lines()
+    total = len(lines)
+
+    if total == 0:
+        return "Stream is empty."
+
+    # Build numbered content for LLM
+    numbered_content = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+
+    prompt = f"""Find all sections in this stream file that are relevant to the query. Return a list of matches, one per line.
+
+Format: YYYY-MM-DD:[start-end] reason
+Example output:
+2025-01-15:[142-158] discussed project X timeline and blockers
+2025-01-18:[201-215] follow-up on project X with new estimates
+
+Rules:
+- Include line ranges that contain relevant information
+- Expand ranges to include full context (don't cut mid-conversation)
+- Keep reason brief (under 10 words) - just enough context to decide if worth reading
+- If nothing relevant found, return: (no matches)
+- Return ONLY the formatted lines, no preamble or explanation
+
+Stream content ({total} lines):
+{numbered_content}
+
+Query: {query}"""
+
+    try:
+        adapter = get_long_context_adapter()
+        msg = Message(role=MessageRole.USER, content=prompt)
+        response, _ = await adapter.complete(
+            system_prompt="",
+            messages=[msg],
+        )
+        return response.content or "(no response)"
+    except asyncio.TimeoutError:
+        return "Stream find timed out"
+    except Exception as e:
+        return f"Stream find error: {e}"
+
+
 def _find_latest_snapshot() -> Path | None:
     """Find the most recent snapshot-YYYY-MM-DD-HH-MM.txt file."""
     pattern = re.compile(r"^snapshot-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2})\.txt$")
@@ -1454,6 +1515,8 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_web_search(args["query"])
     if name == "ask_stream":
         return await tool_ask_stream(args["query"])
+    if name == "stream_find":
+        return await tool_stream_find(args["query"])
     if name == "session_brief":
         return tool_session_brief()
     if name == "ask_attachment":
