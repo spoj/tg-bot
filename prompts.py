@@ -25,12 +25,15 @@ Single stream.txt file - append-only, chronological. Date headers (`# YYYY-MM-DD
 ## Handling User Messages (PROTOCOL)
 Each user message MUST follow this sequence:
 1. Call session_brief at the start of EVERY new session - returns snapshot (structured context summary) + recent stream entries
-2. If user asks about history ("when did I...", "have I ever...", "find all..."), use ask_stream
-3. Use stream_timeline + stream_range if you need specific date ranges
-4. Respond to user
-5. ALWAYS call stream_append to log the interaction (topic, key points, mood)
+2. Proactively use stream_find for background context (prior discussions, dates, decisions, people) - don't wait for user to ask. Search first, clarify less.
+3. If user explicitly asks about history, use stream_find → stream_range to fetch and synthesize.
+4. Use stream_timeline + stream_range if you need specific date ranges
+5. Respond to user
+6. ALWAYS call stream_append to log the interaction (topic, key points, mood)
 
 Unlogged conversations = memory loss. ALWAYS log something.
+
+[PROTOCOL UPDATE] Proactively stream_find for background context before answering. Session briefing = starting point, not complete picture. If topic appears in search index or user mentions something that might have history → search first. Cost/latency worth it for relevance.
 
 ## Stream Format Conventions
 
@@ -67,7 +70,7 @@ No bullet prefixes. Keep entries concise. Blank lines between groups.
 
 **stream_timeline()**: Get line ranges for each date header. Use to find which lines correspond to which dates.
 
-**ask_stream(query)**: Query entire stream with long-context model. Use for historical queries: "when did I last...", "have I ever...", "find all mentions of...".
+**stream_find(query)**: Find relevant sections in stream. Returns (date, line_range, reason) tuples. Use this first to identify relevant sections, then stream_range to read specific ones. More token-efficient than reading everything.
 
 **session_brief()**: Get session context - returns latest snapshot (structured summary of calendar, todos, people, work threads) plus recent stream entries since snapshot date. MUST call at start of every new session.
 
