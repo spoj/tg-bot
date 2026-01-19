@@ -828,29 +828,43 @@ def tool_stream_timeline() -> str:
     return "\n".join(output)
 
 
-async def tool_ask_stream(query: str) -> str:
-    """Ask a question about the entire stream.txt file using long-context model."""
+def _build_stream_content_message() -> tuple[Message, int] | None:
+    """Build the cacheable stream content message. Returns (message, total_lines) or None if empty."""
     lines = _read_stream_lines()
     total = len(lines)
 
     if total == 0:
+        return None
+
+    # Numbered content - same format for both ask and find
+    numbered_content = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+    content_msg = Message(
+        role=MessageRole.USER,
+        content=f"Stream file ({total} lines):\n{numbered_content}",
+    )
+    return content_msg, total
+
+
+async def tool_ask_stream(query: str) -> str:
+    """Ask a question about the entire stream.txt file using long-context model."""
+    result = _build_stream_content_message()
+    if result is None:
         return "Stream is empty."
 
-    content = "\n".join(lines)
+    content_msg, _ = result
 
-    prompt = f"""Answer this question based on the stream file content. Be concise and cite specific entries when relevant. If the information is not in the file, say so.
+    task_msg = Message(
+        role=MessageRole.USER,
+        content=f"""Answer this question about the stream file above. Be concise and cite specific line numbers when relevant. If the information is not in the file, say so.
 
-Stream content ({total} lines):
-{content}
-
-Question: {query}"""
+Question: {query}""",
+    )
 
     try:
         adapter = get_long_context_adapter()
-        msg = Message(role=MessageRole.USER, content=prompt)
         response, _ = await adapter.complete(
             system_prompt="",
-            messages=[msg],
+            messages=[content_msg, task_msg],
         )
         return response.content or ""
     except asyncio.TimeoutError:
@@ -861,16 +875,15 @@ Question: {query}"""
 
 async def tool_stream_find(query: str) -> str:
     """Find relevant sections in stream.txt, returning (date, line_range, reason) tuples."""
-    lines = _read_stream_lines()
-    total = len(lines)
-
-    if total == 0:
+    result = _build_stream_content_message()
+    if result is None:
         return "Stream is empty."
 
-    # Build numbered content for LLM
-    numbered_content = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+    content_msg, _ = result
 
-    prompt = f"""Find all sections in this stream file that are relevant to the query. Return a list of matches, one per line.
+    task_msg = Message(
+        role=MessageRole.USER,
+        content=f"""Find all sections in the stream file above that are relevant to the query. Return a list of matches, one per line.
 
 Format: YYYY-MM-DD:[start-end] reason
 Example output:
@@ -884,17 +897,14 @@ Rules:
 - If nothing relevant found, return: (no matches)
 - Return ONLY the formatted lines, no preamble or explanation
 
-Stream content ({total} lines):
-{numbered_content}
-
-Query: {query}"""
+Query: {query}""",
+    )
 
     try:
         adapter = get_long_context_adapter()
-        msg = Message(role=MessageRole.USER, content=prompt)
         response, _ = await adapter.complete(
             system_prompt="",
-            messages=[msg],
+            messages=[content_msg, task_msg],
         )
         return response.content or "(no response)"
     except asyncio.TimeoutError:
