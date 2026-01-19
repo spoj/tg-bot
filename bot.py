@@ -102,6 +102,12 @@ STREAM_LOCK = get_stream_lock()
 # Global bot reference for tools that need to send messages
 _bot = None
 
+# Tools disabled at runtime but kept in TOOLS for easy re-enabling.
+# - ask_stream: Prefer stream_find + stream_range for better token efficiency.
+#   stream_find returns line ranges with reasons, letting the agent selectively
+#   read only relevant sections instead of getting a synthesized answer.
+DISABLED_TOOLS = {"ask_stream"}
+
 # Tool definitions for Opus
 TOOLS = [
     {
@@ -1786,10 +1792,16 @@ async def run_agent(
 
         for attempt in range(max_retries):
             try:
+                # Filter out disabled tools at runtime
+                active_tools = [
+                    t
+                    for t in TOOLS
+                    if t.get("function", {}).get("name") not in DISABLED_TOOLS
+                ]
                 response_msg, usage = await adapter.complete(
                     system_prompt=system_prompt,
                     messages=session.messages,
-                    tools=TOOLS,
+                    tools=active_tools,
                 )
                 break  # Success, exit retry loop
             except Exception as e:
