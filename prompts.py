@@ -33,8 +33,6 @@ Each user message MUST follow this sequence:
 
 Unlogged conversations = memory loss. ALWAYS log something.
 
-[PROTOCOL UPDATE] Proactively stream_find for background context before answering. Session briefing = starting point, not complete picture. If topic appears in search index or user mentions something that might have history → search first. Cost/latency worth it for relevance.
-
 ## Stream Format Conventions
 
 Formats are conventional except the date header. which is mandatory for splitting dates. The others are conventional foramts that aid parsing only
