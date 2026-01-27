@@ -6,7 +6,7 @@ IMAGE_DESCRIBE = "Describe this image in detail. Include all visible text, numbe
 
 IMAGE_DESCRIBE_WITH_CAPTION = "The user sent this image with caption: '{caption}'. Describe what you see in detail, including all visible text, numbers, and labels."
 
-AUDIO_TRANSCRIBE = "Transcribe this audio exactly and completely. Output only the transcript, nothing else."
+AUDIO_TRANSCRIBE = "Transcribe this audio exactly and completely. Output only the transcript, nothing else. If there is no speech or the audio is silent/empty, output exactly: [no speech]"
 
 PDF_SUMMARIZE = "Briefly summarize this PDF document. Include: page count, document type/purpose, key dates, amounts, names, and main points. Keep it concise (2-4 sentences)."
 

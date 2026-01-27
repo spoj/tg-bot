@@ -1671,6 +1671,10 @@ async def preprocess_audio(file_path: str) -> str | None:
         )
         result = response.content
         if result:
+            # Check for no-speech marker
+            if result.strip().lower() in ("[no speech]", "no speech"):
+                print("[preprocess_audio] No speech detected", flush=True)
+                return None
             print(f"[preprocess_audio] Success: {result[:50]}...", flush=True)
             return result
         print("[preprocess_audio] Failed: empty response", flush=True)
