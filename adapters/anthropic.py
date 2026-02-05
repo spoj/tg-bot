@@ -26,7 +26,7 @@ class AnthropicAdapter:
 
     def __init__(
         self,
-        model: str = "openrouter/anthropic/claude-opus-4.5",
+        model: str = "openrouter/anthropic/claude-opus-4.6",
         reasoning: dict | None = None,
         max_tokens: int = 16000,
         timeout: int = 600,

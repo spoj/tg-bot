@@ -44,7 +44,7 @@ def get_reasoning_adapter() -> ModelAdapter:
     """
     global _reasoning_adapter, _reasoning_model
 
-    model = os.environ.get("AGENT_MODEL", "openrouter/anthropic/claude-opus-4.5")
+    model = os.environ.get("AGENT_MODEL", "openrouter/anthropic/claude-opus-4.6")
 
     # Recreate singleton if model changed at runtime
     if _reasoning_adapter is None or _reasoning_model != model:
