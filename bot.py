@@ -13,6 +13,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from dotenv import load_dotenv
 import litellm
@@ -44,6 +45,7 @@ from prompts import (
     DEFAULT_SYSTEM_PROMPT,
 )
 from e2b_sandbox import sandbox_manager
+from agent_loop import run_agent_loop, LoopHooks, AgentResult
 from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -242,6 +244,14 @@ TOOLS = [
                 "properties": {},
                 "required": [],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "roll_snapshot",
+            "description": "Roll forward the latest snapshot using recent stream updates. Runs in background - returns immediately. Creates a new snapshot-YYYY-MM-DD-HH-MM.txt; logs result to stream when done.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -961,6 +971,352 @@ def _extract_stream_from_date(lines: list[str], from_date: str) -> list[str]:
     return result
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int from env with fallback."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _build_roll_snapshot_system_prompt() -> str:
+    return (
+        "You are a snapshot roll-forward agent. You have tools to view and edit the "
+        "snapshot in memory. Use snapshot_view to see the current state, and "
+        "snapshot_replace to make targeted edits. Use stream_find and stream_range "
+        "if you need to check earlier stream content beyond what's shown.\n\n"
+        "Guidelines:\n"
+        "- Make surgical edits - update specific sections, don't rewrite everything\n"
+        "- Preserve format and section order\n"
+        "- Move completed items to COMPLETED RECENTLY, remove old completed items\n"
+        "- Update UPCOMING dates, remove past events\n"
+        "- Update ACTIVE WORKSTREAMS with new developments\n"
+        "- Do not invent details - only use information from the stream\n"
+        "- When done editing, stop calling tools"
+    )
+
+
+def _build_roll_snapshot_user_prompt(stream_section: str) -> str:
+    return (
+        "Here are the recent stream entries since the last snapshot:\n\n"
+        f"{stream_section}\n\n"
+        "Use snapshot_view to see the current snapshot, then use snapshot_replace "
+        "to make targeted updates based on the stream entries above."
+    )
+
+
+def _extract_litellm_usage(response) -> dict[str, int]:
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return {}
+    result = {
+        "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+    }
+    # Extract cache stats from prompt_tokens_details (LiteLLM format)
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        result["cache_read"] = getattr(details, "cached_tokens", 0) or 0
+        result["cache_write"] = getattr(details, "cache_write_tokens", 0) or 0
+    return result
+
+
+# Background job tracking
+_roll_snapshot_running = False
+
+
+async def _do_roll_snapshot() -> str:
+    """Core roll snapshot logic. Returns result string."""
+    latest_snapshot = _find_latest_snapshot()
+    if not latest_snapshot:
+        return "No snapshot-*.txt files found."
+
+    snapshot_date = _get_date_from_snapshot_filename(latest_snapshot)
+    if not snapshot_date:
+        return f"Could not parse date from filename: {latest_snapshot.name}"
+
+    stream_lines = _read_stream_lines()
+    stream_delta = _extract_stream_from_date(stream_lines, snapshot_date)
+    if not "\n".join(stream_delta).strip():
+        return f"No new stream entries since {snapshot_date}"
+
+    # Initialize snapshot buffer with current snapshot content
+    snapshot_buffer = latest_snapshot.read_text()
+    original_size = len(snapshot_buffer)
+
+    # Build stream section for the prompt (with line numbers)
+    total_lines = len(stream_lines)
+    stream_start = total_lines - len(stream_delta) + 1
+    stream_section = "\n".join(
+        f"{stream_start + i}: {line}" for i, line in enumerate(stream_delta)
+    )
+
+    now = datetime.now()
+    filename_time = now.strftime("%Y-%m-%d-%H-%M")
+    new_snapshot_name = f"snapshot-{filename_time}.txt"
+
+    model_name = os.environ.get("AGENT_MODEL") or "openrouter/openai/gpt-5.2"
+    max_tokens = _env_int("AGENT_MAX_TOKENS", 16000)
+    timeout = _env_int("AGENT_TIMEOUT", 600)
+    max_iterations = 50
+
+    system_prompt = _build_roll_snapshot_system_prompt()
+    user_prompt = _build_roll_snapshot_user_prompt(stream_section)
+
+    initial_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # Tools for the roll snapshot agent
+    roll_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "snapshot_view",
+                "description": "View the current snapshot content in the buffer.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "snapshot_replace",
+                "description": "Replace exact text in the snapshot. The old_text must match exactly and uniquely.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "old_text": {
+                            "type": "string",
+                            "description": "The exact text to find and replace (must be unique)",
+                        },
+                        "new_text": {
+                            "type": "string",
+                            "description": "The replacement text",
+                        },
+                    },
+                    "required": ["old_text", "new_text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stream_find",
+                "description": "Find relevant sections in stream.txt beyond what's shown. Returns (date, line_range, reason) tuples.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What to search for in the stream history",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stream_range",
+                "description": "Read a specific range of lines from stream.txt (1-indexed, inclusive).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from_line": {
+                            "type": "integer",
+                            "description": "Start line number",
+                        },
+                        "to_line": {
+                            "type": "integer",
+                            "description": "End line number",
+                        },
+                    },
+                    "required": ["from_line", "to_line"],
+                },
+            },
+        },
+    ]
+
+    # Track edits for reporting
+    edit_count = 0
+
+    def do_snapshot_view() -> str:
+        return f"Current snapshot ({len(snapshot_buffer)} chars):\n\n{snapshot_buffer}"
+
+    def do_snapshot_replace(old_text: str, new_text: str) -> str:
+        nonlocal snapshot_buffer, edit_count
+
+        if not old_text:
+            return "Error: old_text cannot be empty"
+
+        count = snapshot_buffer.count(old_text)
+        if count == 0:
+            return "Error: old_text not found in snapshot"
+        if count > 1:
+            return f"Error: old_text found {count} times - provide more context to make it unique"
+
+        snapshot_buffer = snapshot_buffer.replace(old_text, new_text, 1)
+        edit_count += 1
+
+        # Show context around the edit
+        idx = snapshot_buffer.find(new_text)
+        start = max(0, idx - 100)
+        end = min(len(snapshot_buffer), idx + len(new_text) + 100)
+        context = snapshot_buffer[start:end]
+
+        return f"Replaced ({len(old_text)} -> {len(new_text)} chars). Context:\n...{context}..."
+
+    async def tool_executor(name: str, args: dict) -> str:
+        if name == "snapshot_view":
+            return do_snapshot_view()
+        if name == "snapshot_replace":
+            return do_snapshot_replace(
+                args.get("old_text", ""), args.get("new_text", "")
+            )
+        if name == "stream_find":
+            return await tool_stream_find(args.get("query", ""))
+        if name == "stream_range":
+            return tool_stream_range(args.get("from_line", 1), args.get("to_line", 1))
+        return f"Unknown tool: {name}"
+
+    def _add_cache_control(messages: list[dict]) -> None:
+        """Add cache_control to the last message for prompt caching."""
+        if not messages:
+            return
+        last_msg = messages[-1]
+        content = last_msg.get("content")
+        if isinstance(content, str) and content:
+            last_msg["content"] = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        elif isinstance(content, list) and content:
+            if isinstance(content[0], dict):
+                content[0]["cache_control"] = {"type": "ephemeral"}
+
+    async def call_model(messages: list[dict], tool_defs: list[dict] | None):
+        # Add cache control to last message for prompt caching
+        _add_cache_control(messages)
+
+        call_kwargs = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "reasoning_effort": "high",  # Enable extended thinking
+        }
+        if tool_defs:
+            call_kwargs["tools"] = tool_defs
+            call_kwargs["tool_choice"] = "auto"
+
+        response = await litellm.acompletion(**call_kwargs)
+        choices = getattr(response, "choices", None) or []
+        msg = choices[0].message if choices else None
+        tool_calls = []
+        tool_calls_raw = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls_raw:
+            tool_calls.append(
+                {
+                    "id": tc.id,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments or "{}",
+                    },
+                }
+            )
+
+        return {
+            "role": "assistant",
+            "content": (getattr(msg, "content", None) or "") if msg else "",
+            "tool_calls": tool_calls,
+        }, _extract_litellm_usage(response)
+
+    try:
+        result = await run_agent_loop(
+            call_model=call_model,
+            tool_executor=tool_executor,
+            initial_messages=initial_messages,
+            tools=roll_tools,
+            max_iterations=max_iterations,
+            parallel_tools=False,
+        )
+    except Exception as e:
+        return f"Roll snapshot error: {e}"
+
+    if not result.success:
+        return "Agent did not finish within iteration limit."
+
+    # Validate: snapshot shouldn't shrink too much (>30% loss is suspicious)
+    new_size = len(snapshot_buffer)
+    if new_size < original_size * 0.7:
+        return (
+            f"Snapshot shrank too much ({original_size} -> {new_size} chars, "
+            f"{100 - new_size * 100 // original_size}% reduction). Aborting."
+        )
+
+    if edit_count == 0:
+        return "Agent made no edits to the snapshot."
+
+    # Write the final snapshot
+    new_snapshot_path = DATA_DIR / new_snapshot_name
+    try:
+        new_snapshot_path.write_text(snapshot_buffer.rstrip("\n") + "\n")
+    except Exception as e:
+        return f"Failed to write snapshot {new_snapshot_name}: {e}"
+
+    return (
+        f"Updated: {new_snapshot_name}\n"
+        f"Previous: {latest_snapshot.name}\n"
+        f"Stream delta: {len(stream_delta)} lines (from {snapshot_date})\n"
+        f"Edits: {edit_count} | Size: {original_size} -> {new_size} chars\n"
+        f"Model: {model_name} (reasoning=high)\n"
+        f"Iterations: {result.iterations} | Tool calls: {result.tool_calls_count} | "
+        f"Tokens in/out: {result.usage.get('input_tokens', 0)}/{result.usage.get('output_tokens', 0)} | "
+        f"Cache read/write: {result.usage.get('cache_read', 0)}/{result.usage.get('cache_write', 0)}"
+    )
+
+
+async def tool_roll_snapshot() -> str:
+    """Roll forward the latest snapshot in the background.
+
+    Runs the snapshot update as a background task. If already running, returns
+    immediately. When complete, writes a note to the stream.
+    """
+    global _roll_snapshot_running
+
+    if _roll_snapshot_running:
+        return "Roll snapshot already running in background."
+
+    _roll_snapshot_running = True
+
+    async def run_and_log():
+        global _roll_snapshot_running
+        try:
+            result = await _do_roll_snapshot()
+            # Write short note to stream
+            short_note = result.split("\n")[0] if result else "Roll snapshot completed"
+            tool_stream_append(f"\n[BACKGROUND] {short_note}")
+            print(
+                f"[roll_snapshot] Background task completed: {short_note}", flush=True
+            )
+        except Exception as e:
+            tool_stream_append(f"\n[BACKGROUND] Roll snapshot failed: {e}")
+            print(f"[roll_snapshot] Background task failed: {e}", flush=True)
+        finally:
+            _roll_snapshot_running = False
+
+    asyncio.create_task(run_and_log())
+    return "Roll snapshot started in background. Result will be logged to stream when complete."
+
+
 def tool_session_brief() -> str:
     """Get session brief: snapshot + stream from snapshot date onwards."""
     lines = _read_stream_lines()
@@ -1535,6 +1891,8 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
         return await tool_stream_find(args["query"])
     if name == "session_brief":
         return tool_session_brief()
+    if name == "roll_snapshot":
+        return await tool_roll_snapshot()
     if name == "ask_attachment":
         return await tool_ask_attachment(args["attachment_id"], args["question"])
     if name == "send_attachment":
@@ -1720,6 +2078,101 @@ async def preprocess_pdf(file_path: str) -> str | None:
 # --- Agent loop ---
 
 
+def _create_model_callable(
+    adapter: ModelAdapter,
+    system_prompt: str,
+    session: Session,
+) -> "Callable[[list[dict], list[dict] | None], Awaitable[tuple[dict, dict]]]":
+    """Create a model callable that bridges adapter + session to generic loop.
+
+    The generic loop uses dict messages, but we maintain Session with Message objects.
+    This callable:
+    1. Converts session.messages to rendered format via adapter
+    2. Calls the adapter
+    3. Returns (assistant_message_dict, usage_dict)
+
+    The session is updated by the caller (run_agent), not inside this callable.
+    """
+    max_retries = 3
+    retry_delay = 2
+
+    async def call_model(
+        messages: list[dict], tools: list[dict] | None
+    ) -> tuple[dict, dict]:
+        """Call the model with retry logic. Returns (assistant_msg_dict, usage)."""
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries):
+            try:
+                # Use adapter.complete which handles rendering internally
+                response_msg, usage = await adapter.complete(
+                    system_prompt=system_prompt,
+                    messages=session.messages,  # Use session messages, not loop messages
+                    tools=tools,
+                )
+
+                # Convert Message to dict for generic loop
+                # The generic loop needs: content, tool_calls (list of dicts)
+                tool_calls_dicts = []
+                for tc in response_msg.tool_calls:
+                    tool_calls_dicts.append(
+                        {
+                            "id": tc.call_id,
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
+                        }
+                    )
+
+                return {
+                    "role": "assistant",
+                    "content": response_msg.content or "",
+                    "tool_calls": tool_calls_dicts,
+                    "_semantic_message": response_msg,  # Preserve for session
+                }, usage
+
+            except Exception as e:
+                last_error = e
+                error_msg = str(e).lower()
+                is_transient = any(
+                    x in error_msg
+                    for x in [
+                        "overloaded",
+                        "rate",
+                        "internal server",
+                        "503",
+                        "429",
+                        "timeout",
+                        "connection",
+                        "ratelimit",
+                        "service unavailable",
+                    ]
+                )
+                if is_transient and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2**attempt)
+                    print(
+                        f"[call_model] Transient error (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}",
+                        flush=True,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+
+        raise last_error or RuntimeError("Unknown error in call_model")
+
+    return call_model
+
+
+def _create_tool_executor(chat_id: int) -> "Callable[[str, dict], Awaitable[str]]":
+    """Create an async tool executor bound to a chat_id."""
+
+    async def executor(name: str, args: dict) -> str:
+        return await execute_tool(name, args, chat_id)
+
+    return executor
+
+
 async def run_agent(
     user_message: str,
     chat_id: int,
@@ -1728,11 +2181,10 @@ async def run_agent(
 ) -> str | None:
     """Run the agent loop with tools.
 
-    Message batching: If new messages arrive while running, they are queued
-    in session.pending_messages and injected as additional user messages.
-    LLM responses (text or tool requests) are disposable and can be discarded
-    when new messages arrive. Tool results are NOT disposable - once tools
-    execute, their results must be sent to the LLM.
+    Uses the generic agent_loop.run_agent_loop with hooks for:
+    - Pending message draining (interactive chat pattern)
+    - Intermediate response streaming to Telegram
+    - Session synchronization
 
     Args:
         user_message: The user's message to process.
@@ -1758,7 +2210,7 @@ async def run_agent(
     session.messages.append(user_msg)
 
     # Hash the history prefix for consistency verification
-    history_len = len(session.messages) - 1  # Exclude the message we just added
+    history_len = len(session.messages) - 1
     history_hash = (
         hash_messages(session.messages[:history_len]) if history_len > 0 else "empty"
     )
@@ -1767,85 +2219,47 @@ async def run_agent(
         flush=True,
     )
 
-    def drain_pending() -> bool:
-        """Drain pending messages into session. Returns True if any were added."""
-        if not session.pending_messages:
-            return False
-        pending = session.pending_messages[:]
-        session.pending_messages.clear()
-        print(f"[run_agent] Draining {len(pending)} pending messages", flush=True)
-        for text in pending:
-            session.messages.append(Message(role=MessageRole.USER, content=text))
-        return True
+    # Filter out disabled tools
+    active_tools = [
+        t for t in TOOLS if t.get("function", {}).get("name") not in DISABLED_TOOLS
+    ]
 
-    response_msg: Message | None = None
+    # Create callables for the generic loop
+    call_model = _create_model_callable(adapter, system_prompt, session)
+    tool_executor = _create_tool_executor(chat_id)
 
-    for iteration in range(MAX_TOOL_ITERATIONS):
-        # Drain any pending messages before API call
-        drain_pending()
+    # Track iteration for logging
+    iteration_counter = [0]
+
+    # --- Hook: before_model_call ---
+    # Drain pending messages into session
+    async def before_model_call(
+        messages: list[dict],
+    ) -> tuple[list[dict], bool]:
+        iteration_counter[0] += 1
+        modified = False
+
+        if session.pending_messages:
+            pending = session.pending_messages[:]
+            session.pending_messages.clear()
+            print(f"[run_agent] Draining {len(pending)} pending messages", flush=True)
+            for text in pending:
+                session.messages.append(Message(role=MessageRole.USER, content=text))
+            modified = True
 
         print(
-            f"[run_agent] API call iteration={iteration}, messages={len(session.messages)}",
+            f"[run_agent] API call iteration={iteration_counter[0]}, messages={len(session.messages)}",
             flush=True,
         )
+        return messages, modified
 
-        # Retry logic for transient API errors
-        max_retries = 3
-        retry_delay = 2  # seconds, will double each retry
-        last_error: Exception | None = None
-
-        for attempt in range(max_retries):
-            try:
-                # Filter out disabled tools at runtime
-                active_tools = [
-                    t
-                    for t in TOOLS
-                    if t.get("function", {}).get("name") not in DISABLED_TOOLS
-                ]
-                response_msg, usage = await adapter.complete(
-                    system_prompt=system_prompt,
-                    messages=session.messages,
-                    tools=active_tools,
-                )
-                break  # Success, exit retry loop
-            except Exception as e:
-                last_error = e
-                error_msg = str(e).lower()
-                # Retry on transient errors
-                is_transient = any(
-                    x in error_msg
-                    for x in [
-                        "overloaded",
-                        "rate",
-                        "internal server",
-                        "503",
-                        "429",
-                        "timeout",
-                        "connection",
-                        "ratelimit",
-                        "service unavailable",
-                    ]
-                )
-                if is_transient and attempt < max_retries - 1:
-                    wait_time = retry_delay * (2**attempt)
-                    print(
-                        f"[run_agent] Transient API error (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}",
-                        flush=True,
-                    )
-                    await asyncio.sleep(wait_time)
-                    continue
-                # Non-retryable or max retries exhausted
-                print(f"[run_agent] API error: {e}", flush=True)
-                return f"API error: {e}"
-        else:
-            # All retries exhausted
-            print(
-                f"[run_agent] API error after {max_retries} retries: {last_error}",
-                flush=True,
-            )
-            return f"API error (after {max_retries} retries): {last_error}"
-
-        # Log usage stats
+    # --- Hook: after_model_call ---
+    # Log usage and sync session
+    async def after_model_call(
+        iteration: int,
+        assistant_message: dict,
+        usage: dict,
+    ) -> None:
         if usage:
             input_tokens = usage.get("input_tokens", 0)
             output_tokens = usage.get("output_tokens", 0)
@@ -1856,44 +2270,26 @@ async def run_agent(
                 flush=True,
             )
 
-        # Check if done (no tool calls)
-        if not response_msg.tool_calls:
-            # Check for pending messages one more time
-            if drain_pending():
-                # New messages arrived - discard this response, re-call API
-                continue
-
-            # Truly done - save to session and return
-            session.messages.append(response_msg)
-
-            print(
-                f"[run_agent] Done. Total messages: {len(session.messages)}",
-                flush=True,
-            )
-
-            return response_msg.content
-
-        # Has tool calls - but check pending first!
-        # Tool call requests are disposable (not yet executed), so if user sent
-        # new messages, discard this response and let model see the new context
-        if drain_pending():
-            # New messages arrived - discard tool call request, re-call API
+    # --- Hook: before_tool_execution ---
+    # Check for pending messages; if any, discard tool calls and retry
+    # Also: send intermediate text to user, commit assistant message to session
+    async def before_tool_execution(assistant_message: dict) -> bool:
+        # Check pending first - tool calls are disposable
+        if session.pending_messages:
             print(
                 "[run_agent] Discarding tool call request due to pending messages",
                 flush=True,
             )
-            continue
+            return False  # Discard, retry model call
 
-        # No pending - safe to execute tools
-        # Send intermediate text to user immediately (if present)
-        if response_msg.content:
+        # No pending - safe to proceed
+        # Send intermediate text to user immediately
+        content = assistant_message.get("content", "")
+        if content and _bot:
             chunks = (
-                [
-                    response_msg.content[i : i + 4096]
-                    for i in range(0, len(response_msg.content), 4096)
-                ]
-                if len(response_msg.content) > 4096
-                else [response_msg.content]
+                [content[i : i + 4096] for i in range(0, len(content), 4096)]
+                if len(content) > 4096
+                else [content]
             )
             for chunk in chunks:
                 try:
@@ -1903,39 +2299,99 @@ async def run_agent(
                 except TelegramError:
                     await _bot.send_message(chat_id=chat_id, text=chunk)
 
-        # Commit: append assistant message with tool calls
-        session.messages.append(response_msg)
+        # Commit assistant message to session
+        semantic_msg = assistant_message.get("_semantic_message")
+        if semantic_msg:
+            session.messages.append(semantic_msg)
 
-        # Execute ALL tool calls in parallel - NOT interruptible
-        # (tools may have side effects, API requires all tool_calls to have matching results)
-        async def run_tool(tc: ToolCall) -> ToolResult:
-            result = await execute_tool(tc.name, tc.arguments, chat_id)
-            return ToolResult(call_id=tc.call_id, content=result)
+        return True  # Proceed with tool execution
 
-        tool_results = await asyncio.gather(
-            *[run_tool(tc) for tc in response_msg.tool_calls]
-        )
+    # --- Hook: before_final_response ---
+    # If pending messages arrived after model call, discard and retry
+    async def before_final_response(assistant_message: dict) -> bool:
+        if session.pending_messages:
+            print(
+                "[run_agent] Discarding final response due to pending messages",
+                flush=True,
+            )
+            return False
+        return True
 
-        # Append tool results as a single message
-        result_msg = Message(
-            role=MessageRole.TOOL_RESULT,
-            tool_results=list(tool_results),
-        )
+    # --- Hook: after_tool_execution ---
+    # Commit tool results to session
+    async def after_tool_execution(tool_results: list[dict]) -> None:
+        # Convert dict tool results to semantic ToolResult objects
+        results = [
+            ToolResult(call_id=tr["tool_call_id"], content=tr["content"])
+            for tr in tool_results
+        ]
+        result_msg = Message(role=MessageRole.TOOL_RESULT, tool_results=results)
         session.messages.append(result_msg)
 
-        # Loop continues - tool results now committed, will be sent to model
+    # --- Hook: on_final ---
+    # Commit final assistant message to session (if no tool calls)
+    async def on_final(
+        success: bool,
+        iterations: int,
+        final_message: str,
+        total_usage: dict,
+    ) -> None:
+        print(
+            f"[run_agent] Done. success={success}, iterations={iterations}, messages={len(session.messages)}",
+            flush=True,
+        )
+        print(
+            f"[run_agent] Total usage: in={total_usage['input_tokens']} out={total_usage['output_tokens']} "
+            f"cache_read={total_usage['cache_read']} cache_write={total_usage['cache_write']}",
+            flush=True,
+        )
 
-    # Max iterations reached
-    print(
-        f"[run_agent] Max iterations reached. Total messages: {len(session.messages)}",
-        flush=True,
+    # Build hooks
+    hooks = LoopHooks(
+        before_model_call=before_model_call,
+        after_model_call=after_model_call,
+        before_tool_execution=before_tool_execution,
+        after_tool_execution=after_tool_execution,
+        before_final_response=before_final_response,
+        on_final=on_final,
     )
 
-    # Display-only warning (not saved to session)
-    last_content = response_msg.content if response_msg else ""
-    if last_content:
-        return f"{last_content}\n\n(iteration limit reached)"
-    return "(iteration limit reached)"
+    # Run the generic loop
+    # Note: initial_messages is empty because we manage session.messages directly
+    # The call_model callable reads from session.messages
+    try:
+        result = await run_agent_loop(
+            call_model=call_model,
+            tool_executor=tool_executor,
+            initial_messages=[],  # Session manages messages
+            tools=active_tools,
+            max_iterations=MAX_TOOL_ITERATIONS,
+            hooks=hooks,
+            parallel_tools=True,
+        )
+    except Exception as e:
+        print(f"[run_agent] Error in agent loop: {e}", flush=True)
+        return f"API error: {e}"
+
+    # Handle final message
+    if result.success:
+        # Commit final assistant message to session
+        # Find the last assistant message from result.messages
+        for msg in reversed(result.messages):
+            if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                semantic_msg = msg.get("_semantic_message")
+                if semantic_msg:
+                    session.messages.append(semantic_msg)
+                break
+        return result.final_message
+    else:
+        # Max iterations reached
+        if (
+            result.final_message
+            and "iteration limit" not in result.final_message.lower()
+        ):
+            return f"{result.final_message}\n\n(iteration limit reached)"
+        return result.final_message
 
 
 # --- Telegram handlers ---

@@ -25,6 +25,7 @@ Single stream.txt file - append-only, chronological. Date headers (`# YYYY-MM-DD
 ## Handling User Messages (PROTOCOL)
 Each user message MUST follow this sequence:
 1. Call session_brief at the start of EVERY new session - returns snapshot (structured context summary) + recent stream entries
+1b. If the stream section is clearly >4x the snapshot section (rough line/length estimate), call roll_snapshot, then call session_brief again before proceeding
 2. Proactively use stream_find for background context (prior discussions, dates, decisions, people) - don't wait for user to ask. Search first, clarify less.
 3. If user explicitly asks about history, use stream_find → stream_range to fetch and synthesize.
 4. Use stream_timeline + stream_range if you need specific date ranges
@@ -72,6 +73,8 @@ No bullet prefixes. Keep entries concise. Blank lines between groups.
 **stream_find(query)**: Find relevant sections in stream. Returns (date, line_range, reason) tuples. Use this first to identify relevant sections, then stream_range to read specific ones. More token-efficient than reading everything.
 
 **session_brief()**: Get session context - returns latest snapshot (structured summary of calendar, todos, people, work threads) plus recent stream entries since snapshot date. MUST call at start of every new session.
+
+**roll_snapshot()**: Roll forward snapshot when the stream section grows too large (rule of thumb: stream section >4x snapshot section). After rolling, call session_brief again to refresh context.
 
 ## Other Tools
 
