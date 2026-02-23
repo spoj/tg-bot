@@ -249,14 +249,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "roll_snapshot",
-            "description": "Roll forward the latest snapshot using recent stream updates. Runs in background - returns immediately. Creates a new snapshot-YYYY-MM-DD-HH-MM.txt; logs result to stream when done.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "web_search",
             "description": "Search the web for current information. Use for weather, news, facts, recommendations, prices, etc.",
             "parameters": {
@@ -1058,9 +1050,10 @@ async def _do_roll_snapshot() -> str:
     filename_time = now.strftime("%Y-%m-%d-%H-%M")
     new_snapshot_name = f"snapshot-{filename_time}.txt"
 
-    model_name = os.environ.get("AGENT_MODEL") or "openrouter/openai/gpt-5.2"
-    max_tokens = _env_int("AGENT_MAX_TOKENS", 16000)
-    timeout = _env_int("AGENT_TIMEOUT", 600)
+    # Reuse main agent's model settings
+    adapter = get_reasoning_adapter()
+    model_name = adapter.model_name
+    adapter_config = adapter.config
     max_iterations = 50
 
     system_prompt = _build_roll_snapshot_system_prompt()
@@ -1184,11 +1177,14 @@ async def _do_roll_snapshot() -> str:
             return tool_stream_range(args.get("from_line", 1), args.get("to_line", 1))
         return f"Unknown tool: {name}"
 
-    def _add_cache_control(messages: list[dict]) -> None:
-        """Add cache_control to the last message for prompt caching."""
-        if not messages:
-            return
-        last_msg = messages[-1]
+    def _add_cache_control(messages: list[dict]) -> list[dict]:
+        """Return a copy of messages with cache_control on the last message."""
+        import copy
+
+        msgs = copy.deepcopy(messages)
+        if not msgs:
+            return msgs
+        last_msg = msgs[-1]
         content = last_msg.get("content")
         if isinstance(content, str) and content:
             last_msg["content"] = [
@@ -1201,43 +1197,72 @@ async def _do_roll_snapshot() -> str:
         elif isinstance(content, list) and content:
             if isinstance(content[0], dict):
                 content[0]["cache_control"] = {"type": "ephemeral"}
+        return msgs
+
+    max_retries = 3
+    retry_delay = 2
 
     async def call_model(messages: list[dict], tool_defs: list[dict] | None):
-        # Add cache control to last message for prompt caching
-        _add_cache_control(messages)
+        cached_messages = _add_cache_control(messages)
 
-        call_kwargs = {
-            "model": model_name,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "timeout": timeout,
-            "reasoning_effort": "high",  # Enable extended thinking
-        }
+        call_kwargs = dict(adapter_config)
+        call_kwargs["messages"] = cached_messages
         if tool_defs:
             call_kwargs["tools"] = tool_defs
             call_kwargs["tool_choice"] = "auto"
 
-        response = await litellm.acompletion(**call_kwargs)
-        choices = getattr(response, "choices", None) or []
-        msg = choices[0].message if choices else None
-        tool_calls = []
-        tool_calls_raw = getattr(msg, "tool_calls", None) or []
-        for tc in tool_calls_raw:
-            tool_calls.append(
-                {
-                    "id": tc.id,
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}",
-                    },
-                }
-            )
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                response = await litellm.acompletion(**call_kwargs)
+                choices = getattr(response, "choices", None) or []
+                msg = choices[0].message if choices else None
+                tool_calls = []
+                tool_calls_raw = getattr(msg, "tool_calls", None) or []
+                for tc in tool_calls_raw:
+                    tool_calls.append(
+                        {
+                            "id": tc.id,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments or "{}",
+                            },
+                        }
+                    )
 
-        return {
-            "role": "assistant",
-            "content": (getattr(msg, "content", None) or "") if msg else "",
-            "tool_calls": tool_calls,
-        }, _extract_litellm_usage(response)
+                return {
+                    "role": "assistant",
+                    "content": (getattr(msg, "content", None) or "") if msg else "",
+                    "tool_calls": tool_calls,
+                }, _extract_litellm_usage(response)
+            except Exception as e:
+                last_error = e
+                error_msg = str(e).lower()
+                is_transient = any(
+                    x in error_msg
+                    for x in [
+                        "overloaded",
+                        "rate",
+                        "internal server",
+                        "503",
+                        "429",
+                        "timeout",
+                        "connection",
+                        "ratelimit",
+                        "service unavailable",
+                    ]
+                )
+                if is_transient and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2**attempt)
+                    print(
+                        f"[roll_snapshot] Transient error (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}",
+                        flush=True,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+
+        raise last_error or RuntimeError("Unknown error in roll_snapshot call_model")
 
     try:
         result = await run_agent_loop(
@@ -1277,7 +1302,7 @@ async def _do_roll_snapshot() -> str:
         f"Previous: {latest_snapshot.name}\n"
         f"Stream delta: {len(stream_delta)} lines (from {snapshot_date})\n"
         f"Edits: {edit_count} | Size: {original_size} -> {new_size} chars\n"
-        f"Model: {model_name} (reasoning=high)\n"
+        f"Model: {model_name}\n"
         f"Iterations: {result.iterations} | Tool calls: {result.tool_calls_count} | "
         f"Tokens in/out: {result.usage.get('input_tokens', 0)}/{result.usage.get('output_tokens', 0)} | "
         f"Cache read/write: {result.usage.get('cache_read', 0)}/{result.usage.get('cache_write', 0)}"
@@ -1317,8 +1342,12 @@ async def tool_roll_snapshot() -> str:
     return "Roll snapshot started in background. Result will be logged to stream when complete."
 
 
-def tool_session_brief() -> str:
-    """Get session brief: snapshot + stream from snapshot date onwards."""
+async def tool_session_brief() -> str:
+    """Get session brief: snapshot + stream from snapshot date onwards.
+
+    Automatically triggers roll_snapshot in the background if the stream
+    delta exceeds 4x the snapshot size.
+    """
     lines = _read_stream_lines()
     total = len(lines)
 
@@ -1369,11 +1398,24 @@ def tool_session_brief() -> str:
             stream_output = "(no entries)"
             stream_header = "=== STREAM ==="
 
+        # Auto-trigger roll_snapshot if stream delta > 4x snapshot size
+        snapshot_size = len(snapshot_content)
+        delta_size = len("\n".join(delta_lines))
+        roll_notice = ""
+        if snapshot_size > 0 and delta_size > 4 * snapshot_size:
+            ratio = delta_size / snapshot_size
+            print(
+                f"[session_brief] Stream delta ({delta_size}B) is {ratio:.1f}x snapshot ({snapshot_size}B) — auto-triggering roll_snapshot",
+                flush=True,
+            )
+            result = await tool_roll_snapshot()
+            roll_notice = f"\n\n⚠ {result} (stream/snapshot ratio: {ratio:.1f}x)"
+
         return f"""=== SNAPSHOT ({snapshot_path.name}) ===
 {snapshot_content}
 
 {stream_header}
-{stream_output}"""
+{stream_output}{roll_notice}"""
     else:
         # No snapshot: return full stream
         stream_output = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
@@ -1890,9 +1932,7 @@ async def execute_tool(name: str, args: dict, chat_id: int) -> str:
     if name == "stream_find":
         return await tool_stream_find(args["query"])
     if name == "session_brief":
-        return tool_session_brief()
-    if name == "roll_snapshot":
-        return await tool_roll_snapshot()
+        return await tool_session_brief()
     if name == "ask_attachment":
         return await tool_ask_attachment(args["attachment_id"], args["question"])
     if name == "send_attachment":
@@ -2013,7 +2053,7 @@ async def preprocess_audio(file_path: str) -> str | None:
         # Load session brief for context (names, jargon, terminology)
         system_prompt = ""
         try:
-            session_brief = tool_session_brief()
+            session_brief = await tool_session_brief()
             system_prompt = f"Context about the speaker (use for recognizing names, jargon, terminology):\n\n{session_brief}"
             print(
                 f"[preprocess_audio] Loaded session brief context ({len(session_brief)} chars)",
