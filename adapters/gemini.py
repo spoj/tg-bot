@@ -3,7 +3,7 @@
 This adapter handles Gemini models, implementing:
 - Simpler message format (no caching)
 - File-based multimodal format for non-images
-- No extended thinking support
+- Optional reasoning/thinking support (for reasoning-capable models via OpenRouter)
 """
 
 import json
@@ -20,7 +20,7 @@ class GeminiAdapter:
     Simpler than Anthropic:
     - No prompt caching mechanisms
     - Uses 'file' format for audio, video, PDF (not image_url)
-    - No extended thinking to preserve
+    - Optional reasoning support for thinking-capable models (e.g., Gemini 3.1 Pro)
     """
 
     def __init__(
@@ -28,6 +28,8 @@ class GeminiAdapter:
         model: str = "gemini/gemini-3-flash-preview",
         max_tokens: int = 4000,
         timeout: int = 120,
+        reasoning: dict | None = None,
+        provider_order: list[str] | None = None,
     ):
         """Initialize Gemini adapter.
 
@@ -35,6 +37,9 @@ class GeminiAdapter:
             model: Model identifier (litellm format).
             max_tokens: Maximum tokens in response.
             timeout: Request timeout in seconds.
+            reasoning: Optional reasoning config (e.g., {"effort": "high"}).
+                       Passed via extra_body for OpenRouter Gemini models.
+            provider_order: Optional OpenRouter provider routing order.
         """
         self._model = model
         self.config: dict[str, Any] = {
@@ -42,6 +47,16 @@ class GeminiAdapter:
             "max_tokens": max_tokens,
             "timeout": timeout,
         }
+        extra_body: dict[str, Any] = {}
+        if reasoning:
+            extra_body["reasoning"] = reasoning
+        if provider_order:
+            extra_body["provider"] = {
+                "order": provider_order,
+                "allow_fallbacks": False,
+            }
+        if extra_body:
+            self.config["extra_body"] = extra_body
 
     @property
     def model_name(self) -> str:
@@ -97,6 +112,10 @@ class GeminiAdapter:
                     }
                     for tc in msg.tool_calls
                 ]
+
+            # Preserve reasoning for conversation history consistency
+            if msg.thinking:
+                result["reasoning_details"] = msg.thinking
 
             return result
 
@@ -171,7 +190,16 @@ class GeminiAdapter:
                 for tc in raw.tool_calls
             ]
 
-        # Gemini doesn't have extended thinking, so nothing to extract
+        # Extract reasoning/thinking content (for reasoning-capable models)
+        provider_fields = getattr(raw, "provider_specific_fields", None) or {}
+        reasoning = (
+            provider_fields.get("reasoning_content")
+            or provider_fields.get("reasoning_details")
+            or provider_fields.get("reasoning")
+            or getattr(raw, "reasoning_content", None)
+        )
+        if isinstance(reasoning, str) and reasoning:
+            msg.thinking = reasoning
 
         return msg
 

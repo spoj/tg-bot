@@ -40,6 +40,7 @@ def get_reasoning_adapter() -> ModelAdapter:
 
     Supported overrides:
     - `openrouter/openai/gpt-5.2` -> `GPTAdapter`
+    - `openrouter/google/gemini-*` -> `GeminiAdapter` (with reasoning)
     - anything else -> `AnthropicAdapter` (OpenRouter Claude)
     """
     global _reasoning_adapter, _reasoning_model
@@ -53,6 +54,13 @@ def get_reasoning_adapter() -> ModelAdapter:
         if model.startswith("openrouter/openai/") or "gpt" in model.lower():
             _reasoning_adapter = GPTAdapter(
                 model=model,
+                max_tokens=16000,
+                timeout=600,
+            )
+        elif model.startswith("openrouter/google/") or "gemini" in model.lower():
+            _reasoning_adapter = GeminiAdapter(
+                model=model,
+                reasoning={"effort": "high"},
                 max_tokens=16000,
                 timeout=600,
             )
