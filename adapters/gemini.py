@@ -68,7 +68,10 @@ class GeminiAdapter:
         system_prompt: str,
         messages: list[Message],
     ) -> list[dict]:
-        """Render to Gemini format (no caching).
+        """Render to Gemini format.
+
+        Gemini uses implicit caching (automatic prefix-stable caching)
+        so no cache_control breakpoints are needed.
 
         Args:
             system_prompt: The system prompt.
@@ -98,6 +101,12 @@ class GeminiAdapter:
             return {"role": "user", "content": content}
 
         elif msg.role == MessageRole.ASSISTANT:
+            # If we have the raw message from the API, replay it verbatim.
+            # This avoids 500s from OpenRouter when we reconstruct the
+            # message format ourselves (e.g. reasoning_details).
+            if "raw_assistant" in msg.metadata:
+                return {"role": "assistant", **msg.metadata["raw_assistant"]}
+
             result: dict[str, Any] = {"role": "assistant", "content": msg.content}
 
             if msg.tool_calls:
@@ -112,10 +121,6 @@ class GeminiAdapter:
                     }
                     for tc in msg.tool_calls
                 ]
-
-            # Preserve reasoning for conversation history consistency
-            if msg.thinking:
-                result["reasoning_details"] = msg.thinking
 
             return result
 
@@ -171,7 +176,12 @@ class GeminiAdapter:
         return blocks if blocks else ""
 
     def parse_response(self, response: Any) -> Message:
-        """Parse Gemini response into semantic Message."""
+        """Parse Gemini response into semantic Message.
+
+        Stores the raw assistant message dict in metadata so it can be
+        replayed verbatim in subsequent requests (avoids 500s from
+        OpenRouter when we reconstruct the message ourselves).
+        """
         raw = response.choices[0].message
 
         msg = Message(
@@ -179,7 +189,7 @@ class GeminiAdapter:
             content=raw.content.strip() if raw.content else None,
         )
 
-        # Extract tool calls
+        # Extract tool calls (needed for agent loop logic)
         if raw.tool_calls:
             msg.tool_calls = [
                 ToolCall(
@@ -190,7 +200,7 @@ class GeminiAdapter:
                 for tc in raw.tool_calls
             ]
 
-        # Extract reasoning/thinking content (for reasoning-capable models)
+        # Extract reasoning/thinking for display/logging
         provider_fields = getattr(raw, "provider_specific_fields", None) or {}
         reasoning = (
             provider_fields.get("reasoning_content")
@@ -200,6 +210,9 @@ class GeminiAdapter:
         )
         if isinstance(reasoning, str) and reasoning:
             msg.thinking = reasoning
+
+        # Stash the raw message dict so _render_message can replay it as-is
+        msg.metadata["raw_assistant"] = raw.model_dump()
 
         return msg
 
@@ -241,10 +254,18 @@ class GeminiAdapter:
         if not usage:
             return {}
 
-        return {
+        result: dict[str, Any] = {
             "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
             "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
         }
+
+        # Extract cache stats from prompt_tokens_details (OpenRouter/LiteLLM format)
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            result["cache_read"] = getattr(details, "cached_tokens", 0) or 0
+            result["cache_write"] = getattr(details, "cache_write_tokens", 0) or 0
+
+        return result
 
 
 class GrokAdapter:
