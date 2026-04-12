@@ -51,7 +51,7 @@ def get_reasoning_adapter() -> ModelAdapter:
     if _reasoning_adapter is None or _reasoning_model != model:
         _reasoning_model = model
 
-        if model.startswith("openrouter/openai/") or "gpt" in model.lower():
+        if model.startswith("openrouter/openai/") or "gpt" in model.lower() or model.startswith("openrouter/z-ai/"):
             _reasoning_adapter = GPTAdapter(
                 model=model,
                 max_tokens=16000,
