@@ -115,7 +115,7 @@ def get_search_adapter() -> GrokAdapter:
     global _search_adapter
     if _search_adapter is None:
         _search_adapter = GrokAdapter(
-            model=os.environ.get("SEARCH_MODEL", "openrouter/x-ai/grok-4.1-fast"),
+            model=os.environ.get("SEARCH_MODEL", "openrouter/x-ai/grok-4.20"),
             timeout=600,
         )
     return _search_adapter
